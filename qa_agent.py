@@ -34,22 +34,31 @@ def query_knowledge_graph(query: str, nodes: Dict[str, Node]) -> Dict[str, Any]:
         - answer: The generated answer
         - confidence: Confidence score (0-1)
         - relevant_nodes: List of nodes used to generate the answer
+        
+    Raises:
+        Exception: If any error occurs during processing
     """
     
     chat = ChatOpenAI(temperature=0)
     
     system_prompt = """당신은 지식 그래프를 기반으로 질문에 답변하는 AI 어시스턴트입니다.
 주어진 노드들의 정보를 분석하여 질문에 가장 적절한 답변을 생성해주세요.
-답변은 반드시 한국어로 작성해야 하며, 다음 JSON 형식으로 반환해야 합니다:
+
+중요: 응답은 반드시 다음과 같은 JSON 형식이어야 합니다. 다른 형식은 허용되지 않습니다:
 
 {
-    "answer": "답변 내용",
+    "answer": "답변 내용 (정보가 없는 경우: '주어진 정보에서 답변을 찾을 수 없습니다')",
     "confidence": 신뢰도 점수 (0.0 ~ 1.0),
     "relevant_nodes": ["참고한 노드의 제목"]
 }
 
-신뢰도 점수는 답변의 정확성과 완성도를 기반으로 0.0에서 1.0 사이의 값으로 설정해주세요.
-답변에 사용된 모든 정보는 반드시 주어진 노드들의 내용에 기반해야 합니다."""
+규칙:
+1. 응답은 반드시 위의 JSON 형식을 따라야 합니다
+2. 일반 텍스트 응답은 허용되지 않습니다
+3. 정보가 부족하거나 없는 경우에도 JSON 형식을 유지해야 합니다
+4. 모든 답변은 한국어로 작성되어야 합니다
+5. 신뢰도 점수는 0.0에서 1.0 사이의 값이어야 합니다
+6. 답변에 사용된 모든 정보는 반드시 주어진 노드들의 내용에 기반해야 합니다"""
 
     # Convert nodes to a list of dictionaries
     nodes_data = []
@@ -67,41 +76,46 @@ def query_knowledge_graph(query: str, nodes: Dict[str, Node]) -> Dict[str, Any]:
     human_prompt = f"""질문: {query}
 
 사용 가능한 노드들:
-{json.dumps(nodes_data, ensure_ascii=False, indent=2)}"""
+{json.dumps(nodes_data, ensure_ascii=False, indent=2)}
+
+주의: 응답은 반드시 지정된 JSON 형식이어야 합니다."""
 
     messages = [
         SystemMessage(content=system_prompt),
         HumanMessage(content=human_prompt)
     ]
 
-    try:
-        response = chat.invoke(messages)
-        content = response.content
-
-        # Remove any ```json or ``` tags
-        content = re.sub(r'```json\s*|\s*```', '', content)
-        
-        # Parse JSON response
-        result = json.loads(content)
-        
-        # Validate required fields
-        if not all(k in result for k in ['answer', 'confidence', 'relevant_nodes']):
-            raise ValueError("Missing required fields in response")
-            
-        # Convert node titles to strings
-        result['relevant_nodes'] = [str(title) for title in result['relevant_nodes']]
-            
-        return result
-        
-    except json.JSONDecodeError as e:
-        return {
-            "answer": "죄송합니다. 응답을 처리하는 중에 오류가 발생했습니다.",
+    # Let exceptions propagate up
+    response = chat.invoke(messages)
+    content = response.content
+    
+    print("\nRaw response from OpenAI:")
+    print(content)
+    print("\nAfter removing JSON tags:")
+    
+    # Remove any ```json or ``` tags
+    content = re.sub(r'```json\s*|\s*```', '', content)
+    print(content)
+    
+    print("\nAttempting to parse JSON...")
+    
+    # If response is not in JSON format, create a default JSON response
+    if not content.strip().startswith('{'):
+        content = json.dumps({
+            "answer": "주어진 정보에서 답변을 찾을 수 없습니다",
             "confidence": 0.0,
             "relevant_nodes": []
-        }
-    except Exception as e:
-        return {
-            "answer": f"오류 발생: {str(e)}",
-            "confidence": 0.0,
-            "relevant_nodes": []
-        } 
+        }, ensure_ascii=False)
+        print("\nConverted non-JSON response to default JSON format")
+    
+    # Parse JSON response
+    result = json.loads(content)
+    
+    # Validate required fields
+    if not all(k in result for k in ['answer', 'confidence', 'relevant_nodes']):
+        raise ValueError("Missing required fields in response")
+        
+    # Convert node titles to strings
+    result['relevant_nodes'] = [str(title) for title in result['relevant_nodes']]
+        
+    return result 
