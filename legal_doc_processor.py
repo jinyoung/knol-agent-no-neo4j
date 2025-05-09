@@ -5,9 +5,13 @@ import os
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from langgraph.pregel import Graph
+from llm_cache import setup_sqlite_cache
 
 # Load environment variables
 load_dotenv()
+
+# Set up SQLite cache for LLM calls
+setup_sqlite_cache()
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
