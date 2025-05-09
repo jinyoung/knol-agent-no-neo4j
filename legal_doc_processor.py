@@ -7,9 +7,16 @@ from pydantic import BaseModel
 from langgraph.pregel import Graph
 from llm_cache import setup_sqlite_cache
 import tiktoken
+from supabase import create_client, Client
 
 # Load environment variables
 load_dotenv()
+
+# Set up Supabase client
+supabase: Client = create_client(
+    os.getenv("SUPABASE_URL", ""),
+    os.getenv("SUPABASE_KEY", "")
+)
 
 # Set up SQLite cache for LLM calls
 setup_sqlite_cache()
@@ -361,6 +368,36 @@ def merge_contents(llm: ChatOpenAI, existing_content: str, new_content: str) -> 
     result = merge_chain.invoke([existing_content, new_content])
     return result.content
 
+def store_node_in_supabase(node_id: str, node: Node) -> None:
+    """Store a node in Supabase database.
+    
+    Args:
+        node_id (str): The unique identifier of the node
+        node (Node): The node object to store
+    """
+    try:
+        node_data = {
+            "id": node_id,
+            "title": node.title,
+            "content": node.content,
+            "node_type": node.node_type,
+            "relationships": json.dumps(node.relationships),
+            "metadata": json.dumps(node.metadata),
+            "created_at": node.created_at,
+            "updated_at": node.updated_at
+        }
+        
+        # Upsert the node data
+        result = supabase.table("nodes").upsert(node_data).execute()
+        
+        if result.data:
+            print(f"Successfully stored/updated node {node_id} in Supabase")
+        else:
+            print(f"Warning: No data returned when storing node {node_id}")
+            
+    except Exception as e:
+        print(f"Error storing node {node_id} in Supabase: {str(e)}")
+
 def implement_action(state: GraphState) -> Union[GraphState, Dict]:
     """Implements the selected strategy based on classification results."""
     print("\nImplementing action...")
@@ -436,6 +473,10 @@ def implement_action(state: GraphState) -> Union[GraphState, Dict]:
                     rel["relationship_type"],
                     rel.get("metadata")
                 )
+    
+    # After processing nodes, store them in Supabase
+    for node_id, node in state.nodes.items():
+        store_node_in_supabase(node_id, node)
     
     return state
 

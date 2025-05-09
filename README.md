@@ -9,6 +9,7 @@ This web application processes legal document chunks and visualizes the knowledg
 - Visualize the knowledge graph in real-time
 - Interactive web interface
 - Mermaid-based graph visualization
+- Persistent storage with Supabase
 
 ## Setup
 
@@ -18,17 +19,24 @@ pip install -r requirements.txt
 ```
 
 2. Set up environment variables:
-Create a `.env` file with your OpenAI API key:
+Create a `.env` file with your API keys:
 ```
 OPENAI_API_KEY=your_api_key_here
+SUPABASE_URL=your_supabase_project_url
+SUPABASE_KEY=your_supabase_anon_key
 ```
 
-3. Run the application:
+3. Set up Supabase:
+   - Create a new project at [Supabase](https://supabase.com)
+   - Get your project URL and anon key from the project settings
+   - Run the SQL script in `scripts/create_tables.sql` in the Supabase SQL editor
+
+4. Run the application:
 ```bash
 python app.py
 ```
 
-4. Open your browser and navigate to:
+5. Open your browser and navigate to:
 ```
 http://localhost:5000
 ```
@@ -39,6 +47,7 @@ http://localhost:5000
 2. Click "Process Chunk" to add it to the knowledge graph
 3. The graph will update automatically to show new nodes and relationships
 4. Continue adding chunks to build a comprehensive knowledge graph
+5. All nodes are automatically persisted to Supabase for future reference
 
 ## Technical Details
 
@@ -46,11 +55,13 @@ http://localhost:5000
 - Uses OpenAI's GPT-4 for text analysis
 - Mermaid.js for graph visualization
 - Tailwind CSS for styling
+- Supabase for persistent storage
 
 ## Requirements
 
 - Python 3.8+
 - OpenAI API key
+- Supabase account and project
 - Modern web browser
 
 ## How It Works
@@ -73,8 +84,23 @@ http://localhost:5000
    - Managing relationships
    - Handling contradictions with polymorphic nodes
    - Splitting overflow content
+   - Persisting nodes to Supabase
 
 4. **Context Management**: Large nodes are automatically split into coherent subsections while maintaining relationships.
+
+## Database Schema
+
+The application uses the following Supabase table structure:
+
+### Nodes Table
+- `id`: Text (Primary Key) - Unique identifier for the node
+- `title`: Text - Node title
+- `content`: Text - Node content
+- `node_type`: Text - Type of the node
+- `relationships`: JSONB - JSON object containing relationships to other nodes
+- `metadata`: JSONB - Additional node metadata
+- `created_at`: Timestamp - Creation timestamp
+- `updated_at`: Timestamp - Last update timestamp
 
 ## Example Output
 
@@ -93,6 +119,7 @@ You can customize the agent by:
 2. Adjusting the content overflow threshold (default: 2000 characters)
 3. Adding new merge strategies in `implement_action()`
 4. Customizing the node splitting logic in `manage_context()`
+5. Extending the Supabase schema for additional data storage
 
 ## Contributing
 
@@ -103,6 +130,7 @@ Feel free to submit issues and pull requests for:
 - Better content splitting algorithms
 - New relationship types
 - Documentation improvements
+- Database schema enhancements
 
 ## License
 
