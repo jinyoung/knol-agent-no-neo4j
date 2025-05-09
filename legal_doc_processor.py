@@ -161,42 +161,42 @@ def classify_chunk(state: GraphState) -> GraphState:
     {chunk}
     
     Analyze this chunk and determine:
-    1. What entities (people, places, concepts) are mentioned
+    1. What concepts, entities, or topics are mentioned
     2. How the information relates to existing nodes
     3. Whether information should be merged into existing nodes or create new ones
-    4. What relationships exist between entities
+    4. What relationships exist between different concepts/entities
     
     Consider these STRICT guidelines for node creation and updates:
     1. Node Consolidation Rules:
-       - Each person should have exactly ONE biology node
-       - Each place/location should have exactly ONE node (either specific name or 'locations' node)
-       - Merge all information about a subject into its existing node when possible
-       - Only create a new node if the entity type is completely new
+       - Each distinct concept/entity should have exactly ONE node
+       - The node title should be the most concise, representative name for the concept
+       - Merge all related information about a concept into its existing node
+       - Only create a new node if the concept is completely new
     
     2. Content Organization Rules:
-       - Person nodes should contain all biographical info, relationships, and personal activities
-       - Location nodes should contain general facts and relationships with other locations
-       - When information connects multiple entities, add it to ALL relevant nodes
-       - Use relationships to maintain connections between nodes
+       - Each node should contain comprehensive information about its concept
+       - When information connects multiple concepts, add relevant parts to each node
+       - Use relationships to show how concepts are connected
+       - Keep content focused and avoid redundancy
     
     3. Node Merging Priority:
-       - ALWAYS check for existing nodes with similar titles or content
+       - ALWAYS check for existing nodes with similar concepts or content
        - If similar nodes exist, prefer updating existing nodes over creating new ones
-       - Use exact title matches: "영희의 biology", "도시들", etc.
+       - Use clear, descriptive titles that represent the core concept
     
     Return your analysis as JSON:
     {{
         "entities": [
             {{
-                "name": "entity name",
-                "type": "person|place|concept",
-                "node_title": "suggested node title (e.g. '영희의 biology', '도시들')",
-                "primary_content": "main content about this entity",
+                "name": "concept/entity name",
+                "type": "concept|process|term|principle|other",
+                "node_title": "concise representative title",
+                "primary_content": "main content about this concept",
                 "related_content": [
                     {{
-                        "target_entity": "name of related entity",
+                        "target_entity": "name of related concept",
                         "content": "content describing the relationship",
-                        "relationship_type": "relationship type (e.g. 고향친구, 결혼)"
+                        "relationship_type": "type of relationship (e.g. 포함관계, 인과관계, 상하관계)"
                     }}
                 ]
             }}
@@ -220,20 +220,21 @@ def classify_chunk(state: GraphState) -> GraphState:
     }}
     """)
     
-    # Create the classification chain
+    # Create classification chain
     classification_chain = (
-        {"nodes": lambda x: json.dumps(nodes_context, indent=2),
-         "chunk": lambda x: x.current_chunk}
+        {
+            "nodes": lambda x: json.dumps(nodes_context, ensure_ascii=False),
+            "chunk": lambda x: x.current_chunk
+        }
         | classification_prompt
         | llm
         | JsonOutputParser()
     )
     
-    # Run classification
-    print("\nRunning classification...")
-    result = classification_chain.invoke(state)
-    print(f"Classification result: {json.dumps(result, indent=2)}")
-    state.classification = result
+    # Run the classification
+    state.classification = classification_chain.invoke(state)
+    print(f"\nClassification result: {json.dumps(state.classification, indent=2, ensure_ascii=False)}")
+    
     return state
 
 # Strategy Selection Component
@@ -343,7 +344,7 @@ def implement_action(state: GraphState) -> Union[GraphState, Dict]:
             # Find or create node for related entity
             related_nodes = [
                 (rid, n) for rid, n in state.nodes.items()
-                if n.title == f"{related['target_entity']}의 biology" or n.title == related['target_entity']
+                if n.title == related['target_entity']
             ]
             
             if related_nodes:
@@ -357,9 +358,9 @@ def implement_action(state: GraphState) -> Union[GraphState, Dict]:
                 # Create new related node
                 related_id = f"node_{len(state.nodes) + 1}"
                 related_node = Node(
-                    title=f"{related['target_entity']}의 biology",
+                    title=related['target_entity'],
                     content=related["content"],
-                    node_type="person" if "biology" in f"{related['target_entity']}의 biology" else "concept"
+                    node_type=entity.get("type", "concept")  # Default to concept if type not specified
                 )
                 state.nodes[related_id] = related_node
                 # Add relationships
@@ -598,10 +599,15 @@ def merge_similar_nodes(state: GraphState) -> GraphState:
     print("\nMerging similar nodes...")
     llm = ChatOpenAI(temperature=0, model="gpt-4")
     
-    # Group nodes by their base title (without 'biology' suffix)
+    # Update existing titles to remove 'biology' suffix
+    for node_id, node in state.nodes.items():
+        if "의 biology" in node.title:
+            node.title = node.title.replace("의 biology", "")
+    
+    # Group nodes by their base title
     title_groups = {}
     for node_id, node in state.nodes.items():
-        base_title = node.title.replace("의 biology", "").strip()
+        base_title = node.title.strip()
         if base_title not in title_groups:
             title_groups[base_title] = []
         title_groups[base_title].append((node_id, node))
@@ -616,10 +622,8 @@ def merge_similar_nodes(state: GraphState) -> GraphState:
             # Merge other nodes into primary
             for other_id, other_node in nodes[1:]:
                 print(f"Merging node {other_id} into {primary_id}")
-                
                 # Merge content
-                merged_content = merge_contents(llm, primary_node.content, other_node.content)
-                primary_node.content = merged_content
+                primary_node.merge_content(other_node.content, llm)
                 
                 # Merge relationships
                 for rel_type, rel_list in other_node.relationships.items():
@@ -629,14 +633,14 @@ def merge_similar_nodes(state: GraphState) -> GraphState:
                         if rel not in primary_node.relationships[rel_type]:
                             primary_node.relationships[rel_type].append(rel)
                             
-                            # Update reverse relationships
-                            if rel["node_id"] in state.nodes:
-                                target_node = state.nodes[rel["node_id"]]
-                                # Update references to the merged node
-                                for target_rel_type, target_rel_list in target_node.relationships.items():
-                                    for target_rel in target_rel_list:
-                                        if target_rel["node_id"] == other_id:
-                                            target_rel["node_id"] = primary_id
+                # Update references to the merged node
+                for _, node in state.nodes.items():
+                    for rel_type, rel_list in node.relationships.items():
+                        for rel in rel_list:
+                            if isinstance(rel, dict) and rel.get("node_id") == other_id:
+                                rel["node_id"] = primary_id
+                            elif isinstance(rel, str) and rel == other_id:
+                                rel_list[rel_list.index(rel)] = primary_id
                 
                 # Remove merged node
                 del state.nodes[other_id]
