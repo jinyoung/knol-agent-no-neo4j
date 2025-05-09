@@ -133,22 +133,59 @@ class GraphState(BaseModel):
         )
 
 # Classification Component
+def create_summary_chain(llm: ChatOpenAI):
+    """Create a chain for summarizing content."""
+    summary_prompt = ChatPromptTemplate.from_template("""
+    Summarize the following content into key points and attributes.
+    Return as JSON with the following structure:
+    {{
+        "key_points": ["point 1", "point 2", ...],
+        "entities": ["entity1", "entity2", ...],
+        "topics": ["topic1", "topic2", ...],
+        "attributes": {{
+            "attribute1": "value1",
+            "attribute2": "value2"
+        }}
+    }}
+
+    Content to summarize:
+    {content}
+    """)
+    
+    return (
+        {"content": lambda x: x}
+        | summary_prompt
+        | llm
+        | JsonOutputParser()
+    )
+
 def classify_chunk(state: GraphState) -> GraphState:
     """Classifies new chunk to determine relevance and relationships."""
     print("\nClassifying chunk...")
     llm = ChatOpenAI(temperature=0, model="gpt-4")
     
-    # Prepare existing nodes for context
+    # Create summary chain
+    summary_chain = create_summary_chain(llm)
+    
+    # Prepare existing nodes for context - using metadata instead of full content
     nodes_context = []
     for node_id, node in state.nodes.items():
+        # If node doesn't have content summary in metadata, generate it
+        if "content_summary" not in node.metadata:
+            summary = summary_chain.invoke(node.content)
+            node.metadata["content_summary"] = summary
+
         nodes_context.append({
             "id": node_id,
             "title": node.title,
             "type": node.node_type,
-            "content": node.content,
+            "summary": node.metadata.get("content_summary", {}),
             "relationships": node.relationships
         })
     print(f"Existing nodes: {json.dumps(nodes_context, indent=2)}")
+    
+    # First summarize the new chunk
+    chunk_summary = summary_chain.invoke(state.current_chunk)
     
     classification_prompt = ChatPromptTemplate.from_template("""
     You are an AI specialized in analyzing Korean text and organizing information into a knowledge graph.
@@ -157,12 +194,15 @@ def classify_chunk(state: GraphState) -> GraphState:
     Current knowledge graph nodes:
     {nodes}
     
-    New text chunk to analyze:
+    New text chunk summary:
+    {chunk_summary}
+    
+    Original chunk:
     {chunk}
     
     Analyze this chunk and determine:
     1. What concepts, entities, or topics are mentioned
-    2. How the information relates to existing nodes
+    2. How the information relates to existing nodes (using their summaries for comparison)
     3. Whether information should be merged into existing nodes or create new ones
     4. What relationships exist between different concepts/entities
     
@@ -192,11 +232,19 @@ def classify_chunk(state: GraphState) -> GraphState:
                 "type": "concept|process|term|principle|other",
                 "node_title": "concise representative title",
                 "primary_content": "main content about this concept",
+                "content_summary": {{
+                    "key_points": ["point 1", "point 2"],
+                    "entities": ["entity1", "entity2"],
+                    "topics": ["topic1", "topic2"],
+                    "attributes": {{
+                        "attribute1": "value1"
+                    }}
+                }},
                 "related_content": [
                     {{
                         "target_entity": "name of related concept",
                         "content": "content describing the relationship",
-                        "relationship_type": "type of relationship (e.g. 포함관계, 인과관계, 상하관계)"
+                        "relationship_type": "type of relationship"
                     }}
                 ]
             }}
@@ -206,6 +254,14 @@ def classify_chunk(state: GraphState) -> GraphState:
                 "node_id": "existing node id to update",
                 "title": "node title",
                 "content": "content to add or merge",
+                "content_summary": {{
+                    "key_points": ["point 1", "point 2"],
+                    "entities": ["entity1", "entity2"],
+                    "topics": ["topic1", "topic2"],
+                    "attributes": {{
+                        "attribute1": "value1"
+                    }}
+                }},
                 "relationships": [
                     {{
                         "target_node_id": "id of target node",
@@ -220,21 +276,16 @@ def classify_chunk(state: GraphState) -> GraphState:
     }}
     """)
     
-    # Create classification chain
     classification_chain = (
-        {
-            "nodes": lambda x: json.dumps(nodes_context, ensure_ascii=False),
-            "chunk": lambda x: x.current_chunk
-        }
+        {"nodes": lambda x: json.dumps(nodes_context, indent=2),
+         "chunk": lambda x: x.current_chunk,
+         "chunk_summary": lambda x: json.dumps(chunk_summary, indent=2)}
         | classification_prompt
         | llm
         | JsonOutputParser()
     )
     
-    # Run the classification
     state.classification = classification_chain.invoke(state)
-    print(f"\nClassification result: {json.dumps(state.classification, indent=2, ensure_ascii=False)}")
-    
     return state
 
 # Strategy Selection Component
@@ -315,30 +366,20 @@ def implement_action(state: GraphState) -> Union[GraphState, Dict]:
     print("\nImplementing action...")
     
     llm = ChatOpenAI(temperature=0, model="gpt-4")
+    summary_chain = create_summary_chain(llm)
     
-    # Process entities and create/update nodes
-    entities = state.classification.get("entities", [])
-    for entity in entities:
-        # Find or create node for this entity
-        matching_nodes = [
-            (node_id, node) for node_id, node in state.nodes.items()
-            if node.title == entity["node_title"]
-        ]
+    # Process new entities
+    for entity in state.classification.get("entities", []):
+        # Create new node
+        node_id = f"node_{len(state.nodes) + 1}"
+        node = Node(
+            title=entity["node_title"],
+            content=entity["primary_content"],
+            node_type=entity.get("type", "concept"),
+            metadata={"content_summary": entity["content_summary"]}
+        )
+        state.nodes[node_id] = node
         
-        if matching_nodes:
-            # Update existing node
-            node_id, node = matching_nodes[0]
-            node.merge_content(entity["primary_content"], llm)
-        else:
-            # Create new node
-            node_id = f"node_{len(state.nodes) + 1}"
-            node = Node(
-                title=entity["node_title"],
-                content=entity["primary_content"],
-                node_type=entity["type"],
-            )
-            state.nodes[node_id] = node
-            
         # Process related content
         for related in entity.get("related_content", []):
             # Find or create node for related entity
@@ -353,26 +394,41 @@ def implement_action(state: GraphState) -> Union[GraphState, Dict]:
                 node.add_relationship(related_id, related["relationship_type"])
                 related_node.add_relationship(node_id, related["relationship_type"])
                 # Add content to related node
-                related_node.merge_content(related["content"], llm)
+                if related_node.merge_content(related["content"]):
+                    # Update content summary in metadata
+                    summary = summary_chain.invoke(related_node.content)
+                    related_node.metadata["content_summary"] = summary
             else:
                 # Create new related node
                 related_id = f"node_{len(state.nodes) + 1}"
                 related_node = Node(
                     title=related['target_entity'],
                     content=related["content"],
-                    node_type=entity.get("type", "concept")  # Default to concept if type not specified
+                    node_type=entity.get("type", "concept"),
+                    metadata={"content_summary": {
+                        "key_points": [],
+                        "entities": [],
+                        "topics": [],
+                        "attributes": {}
+                    }}
                 )
                 state.nodes[related_id] = related_node
                 # Add relationships
                 node.add_relationship(related_id, related["relationship_type"])
                 related_node.add_relationship(node_id, related["relationship_type"])
+                
+                # Generate content summary
+                summary = summary_chain.invoke(related_node.content)
+                related_node.metadata["content_summary"] = summary
     
     # Process explicit node updates
     for update in state.classification.get("node_updates", []):
         if "node_id" in update and update["node_id"] in state.nodes:
             # Update existing node
             node = state.nodes[update["node_id"]]
-            node.merge_content(update["content"], llm)
+            if node.merge_content(update["content"]):
+                # Update content summary in metadata
+                node.metadata["content_summary"] = update["content_summary"]
             # Update relationships
             for rel in update.get("relationships", []):
                 node.add_relationship(
@@ -380,23 +436,6 @@ def implement_action(state: GraphState) -> Union[GraphState, Dict]:
                     rel["relationship_type"],
                     rel.get("metadata")
                 )
-    
-    # Create new nodes
-    for new_node in state.classification.get("new_nodes", []):
-        node_id = f"node_{len(state.nodes) + 1}"
-        node = Node(
-            title=new_node["title"],
-            content=new_node["content"],
-            node_type=new_node["node_type"]
-        )
-        # Add relationships
-        for rel in new_node.get("relationships", []):
-            node.add_relationship(
-                rel["target_node_id"],
-                rel["relationship_type"],
-                rel.get("metadata")
-            )
-        state.nodes[node_id] = node
     
     return state
 
