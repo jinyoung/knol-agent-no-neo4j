@@ -166,11 +166,23 @@ def classify_chunk(state: GraphState) -> GraphState:
     3. Whether information should be merged into existing nodes or create new ones
     4. What relationships exist between entities
     
-    Consider these guidelines:
-    - Information about a person's characteristics, actions, or relationships should go in their "biology" node
-    - General information about places or concepts should go in topic-specific nodes
-    - When information connects multiple entities, it may need to be distributed across multiple nodes
-    - Relationships between nodes should be explicitly captured
+    Consider these STRICT guidelines for node creation and updates:
+    1. Node Consolidation Rules:
+       - Each person should have exactly ONE biology node
+       - Each place/location should have exactly ONE node (either specific name or 'locations' node)
+       - Merge all information about a subject into its existing node when possible
+       - Only create a new node if the entity type is completely new
+    
+    2. Content Organization Rules:
+       - Person nodes should contain all biographical info, relationships, and personal activities
+       - Location nodes should contain general facts and relationships with other locations
+       - When information connects multiple entities, add it to ALL relevant nodes
+       - Use relationships to maintain connections between nodes
+    
+    3. Node Merging Priority:
+       - ALWAYS check for existing nodes with similar titles or content
+       - If similar nodes exist, prefer updating existing nodes over creating new ones
+       - Use exact title matches: "영희의 biology", "도시들", etc.
     
     Return your analysis as JSON:
     {{
@@ -191,25 +203,9 @@ def classify_chunk(state: GraphState) -> GraphState:
         ],
         "node_updates": [
             {{
-                "node_id": "existing node id to update (optional)",
+                "node_id": "existing node id to update",
                 "title": "node title",
                 "content": "content to add or merge",
-                "relationships": [
-                    {{
-                        "target_node_id": "id of target node",
-                        "relationship_type": "type of relationship",
-                        "metadata": {{
-                            "additional": "relationship metadata"
-                        }}
-                    }}
-                ]
-            }}
-        ],
-        "new_nodes": [
-            {{
-                "title": "node title",
-                "node_type": "node type",
-                "content": "node content",
                 "relationships": [
                     {{
                         "target_node_id": "id of target node",
@@ -556,7 +552,7 @@ def process_document_chunk(processor: Graph, state: GraphState, chunk: str) -> G
     """Process a single chunk of the document."""
     # Create a new state with the current chunk
     current_state = GraphState(
-        nodes=state.nodes.copy(),  # Make a copy of the nodes dictionary
+        nodes=state.nodes.copy(),
         current_chunk=chunk
     )
     
@@ -573,6 +569,7 @@ def process_document_chunk(processor: Graph, state: GraphState, chunk: str) -> G
                 nodes[node_id] = node_data
             else:
                 nodes[node_id] = Node(
+                    title=node_data.get("title", ""),
                     content=node_data.get("content", ""),
                     node_type=node_data.get("node_type", "unknown"),
                     relationships=node_data.get("relationships", {}),
@@ -591,7 +588,60 @@ def process_document_chunk(processor: Graph, state: GraphState, chunk: str) -> G
             overflow_detected=result.get("overflow_detected", False)
         )
     
+    # Merge similar nodes after processing
+    result = merge_similar_nodes(result)
+    
     return result
+
+def merge_similar_nodes(state: GraphState) -> GraphState:
+    """Merge similar nodes based on title and content similarity."""
+    print("\nMerging similar nodes...")
+    llm = ChatOpenAI(temperature=0, model="gpt-4")
+    
+    # Group nodes by their base title (without 'biology' suffix)
+    title_groups = {}
+    for node_id, node in state.nodes.items():
+        base_title = node.title.replace("의 biology", "").strip()
+        if base_title not in title_groups:
+            title_groups[base_title] = []
+        title_groups[base_title].append((node_id, node))
+    
+    # Merge nodes with same base title
+    for base_title, nodes in title_groups.items():
+        if len(nodes) > 1:
+            print(f"\nFound multiple nodes for '{base_title}'")
+            # Use the first node as primary
+            primary_id, primary_node = nodes[0]
+            
+            # Merge other nodes into primary
+            for other_id, other_node in nodes[1:]:
+                print(f"Merging node {other_id} into {primary_id}")
+                
+                # Merge content
+                merged_content = merge_contents(llm, primary_node.content, other_node.content)
+                primary_node.content = merged_content
+                
+                # Merge relationships
+                for rel_type, rel_list in other_node.relationships.items():
+                    if rel_type not in primary_node.relationships:
+                        primary_node.relationships[rel_type] = []
+                    for rel in rel_list:
+                        if rel not in primary_node.relationships[rel_type]:
+                            primary_node.relationships[rel_type].append(rel)
+                            
+                            # Update reverse relationships
+                            if rel["node_id"] in state.nodes:
+                                target_node = state.nodes[rel["node_id"]]
+                                # Update references to the merged node
+                                for target_rel_type, target_rel_list in target_node.relationships.items():
+                                    for target_rel in target_rel_list:
+                                        if target_rel["node_id"] == other_id:
+                                            target_rel["node_id"] = primary_id
+                
+                # Remove merged node
+                del state.nodes[other_id]
+    
+    return state
 
 if __name__ == "__main__":
     # Create the processor
