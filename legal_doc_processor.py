@@ -6,12 +6,17 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 from langgraph.pregel import Graph
 from llm_cache import setup_sqlite_cache
+import tiktoken
 
 # Load environment variables
 load_dotenv()
 
 # Set up SQLite cache for LLM calls
 setup_sqlite_cache()
+
+# Configuration
+MAX_TOKENS_PER_NODE = 1000  # Maximum tokens allowed in a single node before considering split
+ENCODING = tiktoken.get_encoding("cl100k_base")  # GPT-4's encoding
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
@@ -35,6 +40,15 @@ class Node(BaseModel):
         if "updated_at" not in data:
             data["updated_at"] = datetime.now().isoformat()
         super().__init__(**data)
+    
+    def token_count(self) -> int:
+        """Calculate the number of tokens in the node's content."""
+        return len(ENCODING.encode(self.content))
+
+    def would_exceed_token_limit(self, additional_content: str) -> bool:
+        """Check if adding the content would exceed the token limit."""
+        combined_content = self.content + "\n" + additional_content
+        return len(ENCODING.encode(combined_content)) > MAX_TOKENS_PER_NODE
 
 class GraphState(BaseModel):
     """State of the knowledge graph during processing."""
@@ -214,21 +228,84 @@ def select_strategy(state: GraphState) -> GraphState:
     state.strategy = result
     return state
 
-# Action Implementation Component
+def merge_contents(llm: ChatOpenAI, existing_content: str, new_content: str) -> str:
+    """Merge two pieces of content using LLM to create a coherent, comprehensive description."""
+    merge_prompt = ChatPromptTemplate.from_template("""
+    You need to merge two pieces of information about the same topic into a single, coherent description.
+    Make sure no information is lost and the result reads naturally.
+    
+    Existing content:
+    {existing_content}
+    
+    New content to merge:
+    {new_content}
+    
+    Create a single, comprehensive description that includes all the information from both sources.
+    Use clear language and maintain a logical flow.
+    Make sure to preserve all facts and relationships mentioned in both pieces.
+    """)
+    
+    merge_chain = (
+        {"existing_content": lambda x: x[0], "new_content": lambda x: x[1]}
+        | merge_prompt
+        | llm
+    )
+    
+    result = merge_chain.invoke([existing_content, new_content])
+    return result.content
+
 def implement_action(state: GraphState) -> Union[GraphState, Dict]:
     """Implement the selected strategy on the knowledge graph."""
     print(f"\nImplementing action with strategy: {state.strategy['primary_strategy']}")
+    llm = ChatOpenAI(temperature=0, model="gpt-4")
     
     if state.strategy["primary_strategy"] == "add_new":
         print("\nAdding new nodes...")
         for node in state.classification["new_nodes"]:
-            node_id = node["suggested_id"]
-            print(f"Creating node {node_id}")
-            state.nodes[node_id] = Node(
-                content=node["content"],
-                node_type=node["node_type"],
-                relationships=node.get("relationships", {})
-            )
+            # First check if there's a semantically similar existing node
+            similar_node_id = None
+            for existing_id, existing_node in state.nodes.items():
+                if existing_node.node_type == node["node_type"]:
+                    # If they share the same type, try to combine them
+                    if not existing_node.would_exceed_token_limit(node["content"]):
+                        similar_node_id = existing_id
+                        break
+            
+            if similar_node_id:
+                # Combine with existing node using LLM
+                print(f"Combining with existing node {similar_node_id}")
+                merged_content = merge_contents(
+                    llm,
+                    state.nodes[similar_node_id].content,
+                    node["content"]
+                )
+                
+                # Check if merged content exceeds token limit
+                if len(ENCODING.encode(merged_content)) <= MAX_TOKENS_PER_NODE:
+                    state.nodes[similar_node_id].content = merged_content
+                    # Merge relationships
+                    for rel_type, targets in node.get("relationships", {}).items():
+                        if rel_type not in state.nodes[similar_node_id].relationships:
+                            state.nodes[similar_node_id].relationships[rel_type] = []
+                        state.nodes[similar_node_id].relationships[rel_type].extend(targets)
+                else:
+                    # If merged content would exceed limit, create new node
+                    node_id = node["suggested_id"]
+                    print(f"Creating new node {node_id} (merged content would exceed token limit)")
+                    state.nodes[node_id] = Node(
+                        content=node["content"],
+                        node_type=node["node_type"],
+                        relationships=node.get("relationships", {})
+                    )
+            else:
+                # Create new node
+                node_id = node["suggested_id"]
+                print(f"Creating new node {node_id}")
+                state.nodes[node_id] = Node(
+                    content=node["content"],
+                    node_type=node["node_type"],
+                    relationships=node.get("relationships", {})
+                )
             
     elif state.strategy["primary_strategy"] == "complement":
         print("\nComplementing existing nodes...")
@@ -237,28 +314,68 @@ def implement_action(state: GraphState) -> Union[GraphState, Dict]:
             if node_id in state.nodes:
                 print(f"Complementing node {node_id}")
                 print(f"Existing: {state.nodes[node_id].content}")
-                print(f"Adding: {related_node['conditions']}")
-                state.nodes[node_id].content += f"\nAdditional context: {related_node['conditions']}"
+                additional_content = related_node.get("conditions", "")
+                
+                # Merge content using LLM
+                merged_content = merge_contents(
+                    llm,
+                    state.nodes[node_id].content,
+                    additional_content
+                )
+                
+                # Check if merged content would exceed token limit
+                if len(ENCODING.encode(merged_content)) <= MAX_TOKENS_PER_NODE:
+                    print(f"Adding merged content")
+                    state.nodes[node_id].content = merged_content
+                else:
+                    # If it would exceed, create a new node with a relationship
+                    new_node_id = f"{node_id}_continuation"
+                    print(f"Creating continuation node {new_node_id}")
+                    state.nodes[new_node_id] = Node(
+                        content=additional_content,
+                        node_type=state.nodes[node_id].node_type,
+                        relationships={"continues_from": [node_id]}
+                    )
+                    if "has_continuation" not in state.nodes[node_id].relationships:
+                        state.nodes[node_id].relationships["has_continuation"] = []
+                    state.nodes[node_id].relationships["has_continuation"].append(new_node_id)
                 
     elif state.strategy["primary_strategy"] == "handle_contradiction":
         print("\nHandling contradictions...")
         for contradiction in state.classification["contradictions"]:
             node_id = contradiction["node_id"]
-            if node_id not in state.nodes:
-                print(f"Warning: Node {node_id} not found in state, creating new node...")
-                state.nodes[node_id] = Node(
-                    content="Placeholder content for contradicted node",
-                    node_type="regulation",
-                    relationships={}
-                )
-            print(f"Found {contradiction['contradiction_type']} contradiction for node {node_id}")
-            state.nodes[node_id].metadata = state.nodes[node_id].metadata or {}
-            state.nodes[node_id].metadata["contradiction"] = {
-                "type": contradiction["contradiction_type"],
-                "conditions": contradiction["conditions"],
-                "resolution_strategy": contradiction["resolution_strategy"]
-            }
-            
+            if node_id in state.nodes:
+                print(f"Found {contradiction['contradiction_type']} contradiction for node {node_id}")
+                # Add contradiction information to metadata
+                state.nodes[node_id].metadata = state.nodes[node_id].metadata or {}
+                state.nodes[node_id].metadata["contradiction"] = {
+                    "type": contradiction["contradiction_type"],
+                    "conditions": contradiction["conditions"],
+                    "resolution_strategy": contradiction["resolution_strategy"]
+                }
+                
+                # If there are conditions, merge them with the content
+                if contradiction.get("conditions"):
+                    merged_content = merge_contents(
+                        llm,
+                        state.nodes[node_id].content,
+                        f"Under certain conditions: {contradiction['conditions']}"
+                    )
+                    
+                    if len(ENCODING.encode(merged_content)) <= MAX_TOKENS_PER_NODE:
+                        state.nodes[node_id].content = merged_content
+                    else:
+                        # Create a new node for conditions if token limit would be exceeded
+                        condition_node_id = f"{node_id}_conditions"
+                        state.nodes[condition_node_id] = Node(
+                            content=contradiction["conditions"],
+                            node_type=f"{state.nodes[node_id].node_type}_conditions",
+                            relationships={"conditions_for": [node_id]}
+                        )
+                        if "has_conditions" not in state.nodes[node_id].relationships:
+                            state.nodes[node_id].relationships["has_conditions"] = []
+                        state.nodes[node_id].relationships["has_conditions"].append(condition_node_id)
+    
     # Create relationships after handling the primary strategy
     if "create_relationships" in state.strategy.get("sub_strategies", []):
         print("\nCreating relationships...")
@@ -270,12 +387,15 @@ def implement_action(state: GraphState) -> Union[GraphState, Dict]:
                     if node_id in state.nodes:
                         state.nodes[node_id].relationships = state.nodes[node_id].relationships or {}
                         state.nodes[node_id].relationships[rel_type] = target_nodes
-                        
-    # Check for potential overflow in nodes
-    if len(state.nodes) > 100:  # Arbitrary threshold
-        print("\nWarning: Large number of nodes detected, may need to manage context...")
-        state = manage_context(state)
-        
+    
+    # Check for potential overflow based on token count
+    for node_id, node in state.nodes.items():
+        if node.token_count() > MAX_TOKENS_PER_NODE:
+            print(f"\nToken limit exceeded in node {node_id}")
+            state.overflow_detected = True
+            state.action_result["overflow_node"] = node_id
+            break
+    
     return state
 
 # Context Management Component
@@ -289,28 +409,32 @@ def manage_context(state: GraphState) -> GraphState:
     node = state.nodes[node_id]
     
     split_prompt = ChatPromptTemplate.from_template("""
-    Analyze this content and determine the best way to split it into coherent sub-sections:
+    Analyze this content and determine how to split it into coherent sections while maintaining semantic meaning.
+    Each section should be self-contained and meaningful, but try to keep related information together.
+    The goal is to minimize the number of splits while keeping each section under {max_tokens} tokens.
     
-    Content:
+    Content to analyze:
     {content}
     
     Return your analysis as JSON:
     {{
-        "split_type": "categorical|sequential",
         "sections": [
             {{
                 "title": "section title",
-                "content": "section content",
+                "content": "section content that should be under {max_tokens} tokens",
                 "relationships": ["relationship types with parent"]
             }}
         ],
-        "common_content": "content that should stay in parent node"
+        "common_content": "essential content that should stay in parent node (must be under {max_tokens} tokens)"
     }}
     """)
     
     # Create split chain
     split_chain = (
-        {"content": lambda x: x.nodes[x.action_result["overflow_node"]].content}
+        {
+            "content": lambda x: x.nodes[x.action_result["overflow_node"]].content,
+            "max_tokens": lambda _: MAX_TOKENS_PER_NODE
+        }
         | split_prompt
         | llm
         | JsonOutputParser()
@@ -319,20 +443,32 @@ def manage_context(state: GraphState) -> GraphState:
     # Run the split
     result = split_chain.invoke(state)
     
-    # Update parent node
-    node.content = result["common_content"]
-    node.relationships["has_section"] = []
+    # Update parent node with common content
+    if len(ENCODING.encode(result["common_content"])) <= MAX_TOKENS_PER_NODE:
+        node.content = result["common_content"]
+    else:
+        # If common content is still too large, keep the first part that fits
+        tokens = ENCODING.encode(result["common_content"])
+        decoded_content = ENCODING.decode(tokens[:MAX_TOKENS_PER_NODE])
+        node.content = decoded_content
     
-    # Create child nodes
-    for i, section in enumerate(result["sections"]):
-        section_id = f"{node_id}_section_{i+1}"
-        state.nodes[section_id] = Node(
-            content=section["content"],
-            node_type=f"{node.node_type}_{section['title'].lower().replace(' ', '_')}",
-            relationships={"section_of": [node_id]},
-            metadata={"title": section["title"]}
-        )
-        node.relationships["has_section"].append(section_id)
+    # Create continuation nodes only if needed
+    current_node = node
+    for section in result["sections"]:
+        if len(ENCODING.encode(section["content"])) > 0:  # Only create node if there's content
+            section_id = f"{node_id}_continuation_{len(node.relationships.get('has_continuation', []))}"
+            state.nodes[section_id] = Node(
+                content=section["content"],
+                node_type=node.node_type,
+                relationships={"continues_from": [current_node.node_id if hasattr(current_node, 'node_id') else node_id]},
+                metadata={"title": section["title"]}
+            )
+            
+            # Update relationships
+            if "has_continuation" not in current_node.relationships:
+                current_node.relationships["has_continuation"] = []
+            current_node.relationships["has_continuation"].append(section_id)
+            current_node = state.nodes[section_id]
     
     state.overflow_detected = False
     state.action_result["context_managed"] = True
