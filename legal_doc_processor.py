@@ -1,8 +1,10 @@
-from typing import Dict, List, Tuple, Any, Optional, Literal, TypedDict
+from typing import Dict, List, Tuple, Any, Optional, Literal, TypedDict, Union
 import json
 from datetime import datetime
 import os
 from dotenv import load_dotenv
+from pydantic import BaseModel
+from langgraph.pregel import Graph
 
 # Load environment variables
 load_dotenv()
@@ -12,26 +14,76 @@ from langchain_openai import ChatOpenAI
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import JsonOutputParser
 from langgraph.graph import StateGraph, END
-from pydantic import BaseModel, Field
 
 # Define data structures
 class Node(BaseModel):
+    """A node in the knowledge graph."""
     content: str
     node_type: str
-    relationships: Dict[str, List[str]] = Field(default_factory=dict)
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-    created_at: str = Field(default_factory=lambda: datetime.now().isoformat())
-    updated_at: str = Field(default_factory=lambda: datetime.now().isoformat())
+    relationships: Dict[str, List[str]] = {}
+    metadata: Dict[str, Any] = {}
+    created_at: str = ""
+    updated_at: str = ""
+
+    def __init__(self, **data):
+        if "created_at" not in data:
+            data["created_at"] = datetime.now().isoformat()
+        if "updated_at" not in data:
+            data["updated_at"] = datetime.now().isoformat()
+        super().__init__(**data)
 
 class GraphState(BaseModel):
-    nodes: Dict[str, Node] = Field(default_factory=dict)
+    """State of the knowledge graph during processing."""
+    nodes: Dict[str, Node] = {}
     current_chunk: str = ""
-    classification_result: Dict = Field(default_factory=dict)
-    merge_strategy: str = ""
-    action_result: Dict = Field(default_factory=dict)
-    user_query: Optional[str] = None
+    classification: Dict[str, Any] = {}
+    strategy: Dict[str, Any] = {}
+    action_result: Dict[str, Any] = {}
     overflow_detected: bool = False
-    context: Dict[str, Any] = Field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert the state to a dictionary."""
+        return {
+            "nodes": {
+                node_id: {
+                    "content": node.content,
+                    "node_type": node.node_type,
+                    "relationships": node.relationships,
+                    "metadata": node.metadata,
+                    "created_at": node.created_at,
+                    "updated_at": node.updated_at
+                }
+                for node_id, node in self.nodes.items()
+            },
+            "current_chunk": self.current_chunk,
+            "classification": self.classification,
+            "strategy": self.strategy,
+            "action_result": self.action_result,
+            "overflow_detected": self.overflow_detected
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'GraphState':
+        """Create a state from a dictionary."""
+        nodes = {}
+        for node_id, node_data in data.get("nodes", {}).items():
+            nodes[node_id] = Node(
+                content=node_data["content"],
+                node_type=node_data["node_type"],
+                relationships=node_data.get("relationships", {}),
+                metadata=node_data.get("metadata", {}),
+                created_at=node_data.get("created_at"),
+                updated_at=node_data.get("updated_at")
+            )
+        
+        return cls(
+            nodes=nodes,
+            current_chunk=data.get("current_chunk", ""),
+            classification=data.get("classification", {}),
+            strategy=data.get("strategy", {}),
+            action_result=data.get("action_result", {}),
+            overflow_detected=data.get("overflow_detected", False)
+        )
 
 # Classification Component
 def classify_chunk(state: GraphState) -> GraphState:
@@ -108,7 +160,7 @@ def classify_chunk(state: GraphState) -> GraphState:
     print("\nRunning classification...")
     result = classification_chain.invoke(state)
     print(f"Classification result: {json.dumps(result, indent=2)}")
-    state.classification_result = result
+    state.classification = result
     return state
 
 # Strategy Selection Component
@@ -144,7 +196,7 @@ def select_strategy(state: GraphState) -> GraphState:
     
     # Create strategy chain
     strategy_chain = (
-        {"classification": lambda x: json.dumps(x.classification_result, indent=2),
+        {"classification": lambda x: json.dumps(x.classification, indent=2),
          "chunk": lambda x: x.current_chunk}
         | strategy_prompt
         | llm
@@ -155,185 +207,71 @@ def select_strategy(state: GraphState) -> GraphState:
     print("\nRunning strategy selection...")
     result = strategy_chain.invoke(state)
     print(f"Strategy result: {json.dumps(result, indent=2)}")
-    state.merge_strategy = result["primary_strategy"]
-    state.context["strategy_details"] = result
+    state.strategy = result
     return state
 
 # Action Implementation Component
-def implement_action(state: GraphState) -> GraphState:
-    """Implements the selected strategy to update the knowledge graph."""
-    print(f"\nImplementing action with strategy: {state.merge_strategy}")
-    llm = ChatOpenAI(temperature=0, model="gpt-4")
+def implement_action(state: GraphState) -> Union[GraphState, Dict]:
+    """Implement the selected strategy on the knowledge graph."""
+    print(f"\nImplementing action with strategy: {state.strategy['primary_strategy']}")
     
-    if state.merge_strategy == "add_new":
+    if state.strategy["primary_strategy"] == "add_new":
         print("\nAdding new nodes...")
-        # Create new nodes
-        for new_node in state.classification_result["new_nodes"]:
-            node_id = new_node["suggested_id"]
+        for node in state.classification["new_nodes"]:
+            node_id = node["suggested_id"]
             print(f"Creating node {node_id}")
             state.nodes[node_id] = Node(
-                content=new_node["content"],
-                node_type=new_node["node_type"],
-                relationships=new_node["relationships"]
+                content=node["content"],
+                node_type=node["node_type"],
+                relationships=node.get("relationships", {})
             )
             
-    elif state.merge_strategy == "complement":
+    elif state.strategy["primary_strategy"] == "complement":
         print("\nComplementing existing nodes...")
-        # Update existing nodes with new information
-        for related in state.classification_result["related_nodes"]:
-            if related["relationship_type"] == "complements":
-                node_id = related["node_id"]
-                if node_id in state.nodes:
-                    print(f"Updating node {node_id}")
-                    merge_prompt = ChatPromptTemplate.from_template("""
-                    Merge the following information coherently:
-                    
-                    Existing content:
-                    {existing}
-                    
-                    New information:
-                    {new_info}
-                    
-                    Return the merged content that preserves all important details.
-                    """)
-                    
-                    merge_chain = (
-                        {"existing": lambda x: x.nodes[node_id].content,
-                         "new_info": lambda x: x.current_chunk}
-                        | merge_prompt
-                        | llm
-                    )
-                    
-                    result = merge_chain.invoke(state)
-                    state.nodes[node_id].content = result.content
-                    state.nodes[node_id].updated_at = datetime.now().isoformat()
-                    
-    elif state.merge_strategy == "handle_contradiction":
+        for related_node in state.classification["related_nodes"]:
+            node_id = related_node["node_id"]
+            if node_id in state.nodes:
+                print(f"Complementing node {node_id}")
+                print(f"Existing: {state.nodes[node_id].content}")
+                print(f"Adding: {related_node['conditions']}")
+                state.nodes[node_id].content += f"\nAdditional context: {related_node['conditions']}"
+                
+    elif state.strategy["primary_strategy"] == "handle_contradiction":
         print("\nHandling contradictions...")
-        for contradiction in state.classification_result["contradictions"]:
+        for contradiction in state.classification["contradictions"]:
             node_id = contradiction["node_id"]
-            if contradiction["contradiction_type"] == "conditional":
-                print(f"Handling conditional contradiction for node {node_id}")
-                # Handle conditional contradiction by creating polymorphic nodes
-                original_node = state.nodes[node_id]
-                
-                # Create a parent node with common information
-                parent_prompt = ChatPromptTemplate.from_template("""
-                Extract the common, non-contradictory information from:
-                
-                Original content:
-                {original}
-                
-                New contradictory content:
-                {new_content}
-                
-                Conditions:
-                {conditions}
-                
-                Return only the common information that applies in all cases.
-                """)
-                
-                parent_chain = (
-                    {"original": lambda x: original_node.content,
-                     "new_content": lambda x: x.current_chunk,
-                     "conditions": lambda x: contradiction["conditions"]}
-                    | parent_prompt
-                    | llm
+            if node_id not in state.nodes:
+                print(f"Warning: Node {node_id} not found in state, creating new node...")
+                state.nodes[node_id] = Node(
+                    content="Placeholder content for contradicted node",
+                    node_type="regulation",
+                    relationships={}
                 )
-                
-                parent_result = parent_chain.invoke(state)
-                
-                # Update original node to be the parent
-                original_node.content = parent_result.content
-                original_node.relationships["has_variant"] = []
-                
-                # Create variant nodes
-                variant_prompt = ChatPromptTemplate.from_template("""
-                Create specific content for a variant node based on the conditions.
-                
-                Conditions:
-                {conditions}
-                
-                Content to adapt:
-                {content}
-                
-                Return the content specifically applicable under these conditions.
-                """)
-                
-                # Create variant for original case
-                original_variant_id = f"{node_id}_variant_1"
-                print(f"Creating variant node {original_variant_id}")
-                variant_chain = (
-                    {"conditions": lambda x: "Original conditions",
-                     "content": lambda x: original_node.content}
-                    | variant_prompt
-                    | llm
-                )
-                variant_result = variant_chain.invoke(state)
-                
-                state.nodes[original_variant_id] = Node(
-                    content=variant_result.content,
-                    node_type=f"{original_node.node_type}_variant",
-                    relationships={"variant_of": [node_id]},
-                    metadata={"conditions": "Original conditions"}
-                )
-                original_node.relationships["has_variant"].append(original_variant_id)
-                
-                # Create variant for new case
-                new_variant_id = f"{node_id}_variant_2"
-                print(f"Creating variant node {new_variant_id}")
-                variant_chain = (
-                    {"conditions": lambda x: contradiction["conditions"],
-                     "content": lambda x: x.current_chunk}
-                    | variant_prompt
-                    | llm
-                )
-                variant_result = variant_chain.invoke(state)
-                
-                state.nodes[new_variant_id] = Node(
-                    content=variant_result.content,
-                    node_type=f"{original_node.node_type}_variant",
-                    relationships={"variant_of": [node_id]},
-                    metadata={"conditions": contradiction["conditions"]}
-                )
-                original_node.relationships["has_variant"].append(new_variant_id)
-                
-            else:
-                print(f"Found direct contradiction for node {node_id}")
-                # Direct contradiction - need user input
-                state.user_query = f"""
-                Found contradictory information:
-                
-                Existing: {state.nodes[node_id].content}
-                
-                New: {state.current_chunk}
-                
-                Please specify which version should be kept or provide conditions under which each version applies.
-                """
-                return state
-    
-    elif state.merge_strategy == "create_relationships":
-        print("\nCreating relationships...")
-        # Add new relationships between nodes
-        for related in state.classification_result["related_nodes"]:
-            from_node = related.get("from_node")
-            to_node = related.get("to_node")
-            rel_type = related.get("relationship_type")
+            print(f"Found {contradiction['contradiction_type']} contradiction for node {node_id}")
+            state.nodes[node_id].metadata = state.nodes[node_id].metadata or {}
+            state.nodes[node_id].metadata["contradiction"] = {
+                "type": contradiction["contradiction_type"],
+                "conditions": contradiction["conditions"],
+                "resolution_strategy": contradiction["resolution_strategy"]
+            }
             
-            if from_node in state.nodes and to_node in state.nodes:
-                print(f"Adding relationship {rel_type} from {from_node} to {to_node}")
-                if rel_type not in state.nodes[from_node].relationships:
-                    state.nodes[from_node].relationships[rel_type] = []
-                state.nodes[from_node].relationships[rel_type].append(to_node)
-    
-    # Check for potential overflow
-    for node_id, node in state.nodes.items():
-        if len(node.content) > 2000:  # Arbitrary threshold
-            print(f"\nOverflow detected in node {node_id}")
-            state.overflow_detected = True
-            state.action_result["overflow_node"] = node_id
-            break
-    
+    # Create relationships after handling the primary strategy
+    if "create_relationships" in state.strategy.get("sub_strategies", []):
+        print("\nCreating relationships...")
+        for node in state.classification["new_nodes"]:
+            node_id = node["suggested_id"]
+            if "relationships" in node:
+                for rel_type, target_nodes in node["relationships"].items():
+                    print(f"Creating {rel_type} relationship from {node_id} to {target_nodes}")
+                    if node_id in state.nodes:
+                        state.nodes[node_id].relationships = state.nodes[node_id].relationships or {}
+                        state.nodes[node_id].relationships[rel_type] = target_nodes
+                        
+    # Check for potential overflow in nodes
+    if len(state.nodes) > 100:  # Arbitrary threshold
+        print("\nWarning: Large number of nodes detected, may need to manage context...")
+        state = manage_context(state)
+        
     return state
 
 # Context Management Component
@@ -400,32 +338,32 @@ def manage_context(state: GraphState) -> GraphState:
 # User Input Handler
 def handle_user_input(state: GraphState, user_input: str) -> GraphState:
     """Processes user input for contradiction resolution."""
-    if state.user_query and "contradiction" in state.user_query.lower():
+    if state.strategy.get("contradiction_query") and "contradiction" in state.strategy["contradiction_query"].lower():
         node_id = state.action_result.get("node_id")
         if node_id:
             if "conditions:" in user_input.lower():
                 # User provided conditions - create polymorphic nodes
                 conditions = user_input.split("conditions:")[1].strip()
-                state.classification_result["contradictions"] = [{
+                state.strategy['contradictions'] = [{
                     "node_id": node_id,
                     "contradiction_type": "conditional",
                     "conditions": conditions
                 }]
-                state.merge_strategy = "handle_contradiction"
+                state.strategy['primary_strategy'] = "handle_contradiction"
                 state = implement_action(state)
             else:
                 # User provided direct resolution - update node
                 state.nodes[node_id].content = user_input
                 state.nodes[node_id].updated_at = datetime.now().isoformat()
             
-            state.user_query = None
+            state.strategy["contradiction_query"] = None
     
     return state
 
 # Define the routing logic
 def should_continue(state: GraphState) -> Literal["user_input", "continue", "end"]:
     """Determines the next step in the workflow."""
-    if state.user_query:
+    if state.strategy.get("contradiction_query"):
         return "user_input"
     elif state.overflow_detected:
         return "continue"
@@ -469,25 +407,45 @@ def create_legal_doc_processor() -> Any:
     return workflow.compile()
 
 # Example usage
-def process_document_chunk(processor: Any, state: GraphState, chunk: str) -> GraphState:
+def process_document_chunk(processor: Graph, state: GraphState, chunk: str) -> GraphState:
     """Process a single chunk of the document."""
-    state.current_chunk = chunk
-    result = processor.invoke(state)
+    # Create a new state with the current chunk
+    current_state = GraphState(
+        nodes=state.nodes.copy(),  # Make a copy of the nodes dictionary
+        current_chunk=chunk
+    )
     
-    # Convert the result back to GraphState
+    # Invoke the processor with the current state
+    result = processor.invoke(current_state)
+    
+    # If result is not a GraphState, convert it
     if not isinstance(result, GraphState):
-        # Create a new GraphState with the data from result
-        new_state = GraphState(
-            nodes=result.nodes if hasattr(result, 'nodes') else {},
-            current_chunk=result.current_chunk if hasattr(result, 'current_chunk') else "",
-            classification_result=result.classification_result if hasattr(result, 'classification_result') else {},
-            merge_strategy=result.merge_strategy if hasattr(result, 'merge_strategy') else "",
-            action_result=result.action_result if hasattr(result, 'action_result') else {},
-            user_query=result.user_query if hasattr(result, 'user_query') else None,
-            overflow_detected=result.overflow_detected if hasattr(result, 'overflow_detected') else False,
-            context=result.context if hasattr(result, 'context') else {}
+        # Create a new nodes dictionary
+        nodes = {}
+        # Convert each node in the result
+        for node_id, node_data in result.get("nodes", {}).items():
+            if isinstance(node_data, Node):
+                nodes[node_id] = node_data
+            else:
+                nodes[node_id] = Node(
+                    content=node_data.get("content", ""),
+                    node_type=node_data.get("node_type", "unknown"),
+                    relationships=node_data.get("relationships", {}),
+                    metadata=node_data.get("metadata", {}),
+                    created_at=node_data.get("created_at", datetime.now().isoformat()),
+                    updated_at=node_data.get("updated_at", datetime.now().isoformat())
+                )
+        
+        # Create a new state with the converted nodes
+        result = GraphState(
+            nodes=nodes,
+            current_chunk=result.get("current_chunk", chunk),
+            classification=result.get("classification", {}),
+            strategy=result.get("strategy", {}),
+            action_result=result.get("action_result", {}),
+            overflow_detected=result.get("overflow_detected", False)
         )
-        return new_state
+    
     return result
 
 if __name__ == "__main__":

@@ -102,12 +102,16 @@ def test_legal_doc_processing():
         
         # Print the current state of the knowledge graph
         print(f"\nKnowledge Graph after Chunk {i}:")
-        for node_id, node in current_state.nodes.items():
-            print(f"\nNode {node_id} ({node.node_type}):")
-            print(f"Content: {node.content}")
-            print("Relationships:", node.relationships)
-            if node.metadata:
-                print("Metadata:", node.metadata)
+        if current_state.nodes:
+            for node_id, node in current_state.nodes.items():
+                print(f"\nNode {node_id} ({node.node_type}):")
+                print(f"Content: {node.content}")
+                if node.relationships:
+                    print("Relationships:", node.relationships)
+                if node.metadata:
+                    print("Metadata:", node.metadata)
+        else:
+            print("No nodes in the knowledge graph.")
         print("\n" + "="*80)
 
 if __name__ == "__main__":
