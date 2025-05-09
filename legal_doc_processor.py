@@ -27,9 +27,10 @@ from langgraph.graph import StateGraph, END
 # Define data structures
 class Node(BaseModel):
     """A node in the knowledge graph."""
+    title: str
     content: str
     node_type: str
-    relationships: Dict[str, List[str]] = {}
+    relationships: Dict[str, List[Dict[str, str]]] = {}  # Changed to support richer relationship data
     metadata: Dict[str, Any] = {}
     created_at: str = ""
     updated_at: str = ""
@@ -39,6 +40,8 @@ class Node(BaseModel):
             data["created_at"] = datetime.now().isoformat()
         if "updated_at" not in data:
             data["updated_at"] = datetime.now().isoformat()
+        if "relationships" not in data:
+            data["relationships"] = {}
         super().__init__(**data)
     
     def token_count(self) -> int:
@@ -49,6 +52,32 @@ class Node(BaseModel):
         """Check if adding the content would exceed the token limit."""
         combined_content = self.content + "\n" + additional_content
         return len(ENCODING.encode(combined_content)) > MAX_TOKENS_PER_NODE
+
+    def add_relationship(self, target_node_id: str, relationship_type: str, metadata: Optional[Dict[str, str]] = None):
+        """Add a relationship to another node with optional metadata."""
+        if relationship_type not in self.relationships:
+            self.relationships[relationship_type] = []
+        
+        rel_data = {"node_id": target_node_id}
+        if metadata:
+            rel_data.update(metadata)
+            
+        if rel_data not in self.relationships[relationship_type]:
+            self.relationships[relationship_type].append(rel_data)
+            
+    def merge_content(self, new_content: str, llm: Optional[ChatOpenAI] = None) -> bool:
+        """Merge new content into the node, optionally using LLM for better merging."""
+        if self.would_exceed_token_limit(new_content):
+            return False
+            
+        if llm:
+            merged = merge_contents(llm, self.content, new_content)
+            self.content = merged
+        else:
+            self.content = f"{self.content}\n{new_content}"
+            
+        self.updated_at = datetime.now().isoformat()
+        return True
 
 class GraphState(BaseModel):
     """State of the knowledge graph during processing."""
@@ -114,6 +143,7 @@ def classify_chunk(state: GraphState) -> GraphState:
     for node_id, node in state.nodes.items():
         nodes_context.append({
             "id": node_id,
+            "title": node.title,
             "type": node.node_type,
             "content": node.content,
             "relationships": node.relationships
@@ -121,7 +151,8 @@ def classify_chunk(state: GraphState) -> GraphState:
     print(f"Existing nodes: {json.dumps(nodes_context, indent=2)}")
     
     classification_prompt = ChatPromptTemplate.from_template("""
-    You are an AI specialized in analyzing legal documents and organizing information into a knowledge graph.
+    You are an AI specialized in analyzing Korean text and organizing information into a knowledge graph.
+    Your task is to analyze new information and determine how it relates to existing knowledge.
     
     Current knowledge graph nodes:
     {nodes}
@@ -130,36 +161,64 @@ def classify_chunk(state: GraphState) -> GraphState:
     {chunk}
     
     Analyze this chunk and determine:
-    1. If it relates to existing nodes (through complementing, contradicting, or referencing them)
-    2. If it contains new concepts that need new nodes
-    3. What relationships exist between the information
-    4. If there are any conditions or context-specific variations
+    1. What entities (people, places, concepts) are mentioned
+    2. How the information relates to existing nodes
+    3. Whether information should be merged into existing nodes or create new ones
+    4. What relationships exist between entities
+    
+    Consider these guidelines:
+    - Information about a person's characteristics, actions, or relationships should go in their "biology" node
+    - General information about places or concepts should go in topic-specific nodes
+    - When information connects multiple entities, it may need to be distributed across multiple nodes
+    - Relationships between nodes should be explicitly captured
     
     Return your analysis as JSON:
     {{
-        "related_nodes": [
+        "entities": [
             {{
-                "node_id": "id of related node",
-                "relationship_type": "complements|contradicts|references|creates_exception_to",
-                "conditions": "any conditions that apply to this relationship (optional)"
+                "name": "entity name",
+                "type": "person|place|concept",
+                "node_title": "suggested node title (e.g. '영희의 biology', '도시들')",
+                "primary_content": "main content about this entity",
+                "related_content": [
+                    {{
+                        "target_entity": "name of related entity",
+                        "content": "content describing the relationship",
+                        "relationship_type": "relationship type (e.g. 고향친구, 결혼)"
+                    }}
+                ]
+            }}
+        ],
+        "node_updates": [
+            {{
+                "node_id": "existing node id to update (optional)",
+                "title": "node title",
+                "content": "content to add or merge",
+                "relationships": [
+                    {{
+                        "target_node_id": "id of target node",
+                        "relationship_type": "type of relationship",
+                        "metadata": {{
+                            "additional": "relationship metadata"
+                        }}
+                    }}
+                ]
             }}
         ],
         "new_nodes": [
             {{
-                "suggested_id": "suggested node id",
-                "node_type": "concept type (e.g., regulation, exception, definition)",
-                "content": "content for this node",
-                "relationships": {{
-                    "relationship_type": ["target_node_id"]
-                }}
-            }}
-        ],
-        "contradictions": [
-            {{
-                "node_id": "contradicted node id",
-                "contradiction_type": "direct|conditional",
-                "conditions": "conditions under which the contradiction applies (if any)",
-                "resolution_strategy": "suggested strategy to resolve contradiction"
+                "title": "node title",
+                "node_type": "node type",
+                "content": "node content",
+                "relationships": [
+                    {{
+                        "target_node_id": "id of target node",
+                        "relationship_type": "type of relationship",
+                        "metadata": {{
+                            "additional": "relationship metadata"
+                        }}
+                    }}
+                ]
             }}
         ]
     }}
@@ -255,146 +314,92 @@ def merge_contents(llm: ChatOpenAI, existing_content: str, new_content: str) -> 
     return result.content
 
 def implement_action(state: GraphState) -> Union[GraphState, Dict]:
-    """Implement the selected strategy on the knowledge graph."""
-    print(f"\nImplementing action with strategy: {state.strategy['primary_strategy']}")
+    """Implements the selected strategy based on classification results."""
+    print("\nImplementing action...")
+    
     llm = ChatOpenAI(temperature=0, model="gpt-4")
     
-    if state.strategy["primary_strategy"] == "add_new":
-        print("\nAdding new nodes...")
-        for node in state.classification["new_nodes"]:
-            # First check if there's a semantically similar existing node
-            similar_node_id = None
-            for existing_id, existing_node in state.nodes.items():
-                if existing_node.node_type == node["node_type"]:
-                    # If they share the same type, try to combine them
-                    if not existing_node.would_exceed_token_limit(node["content"]):
-                        similar_node_id = existing_id
-                        break
+    # Process entities and create/update nodes
+    entities = state.classification.get("entities", [])
+    for entity in entities:
+        # Find or create node for this entity
+        matching_nodes = [
+            (node_id, node) for node_id, node in state.nodes.items()
+            if node.title == entity["node_title"]
+        ]
+        
+        if matching_nodes:
+            # Update existing node
+            node_id, node = matching_nodes[0]
+            node.merge_content(entity["primary_content"], llm)
+        else:
+            # Create new node
+            node_id = f"node_{len(state.nodes) + 1}"
+            node = Node(
+                title=entity["node_title"],
+                content=entity["primary_content"],
+                node_type=entity["type"],
+            )
+            state.nodes[node_id] = node
             
-            if similar_node_id:
-                # Combine with existing node using LLM
-                print(f"Combining with existing node {similar_node_id}")
-                merged_content = merge_contents(
-                    llm,
-                    state.nodes[similar_node_id].content,
-                    node["content"]
-                )
-                
-                # Check if merged content exceeds token limit
-                if len(ENCODING.encode(merged_content)) <= MAX_TOKENS_PER_NODE:
-                    state.nodes[similar_node_id].content = merged_content
-                    # Merge relationships
-                    for rel_type, targets in node.get("relationships", {}).items():
-                        if rel_type not in state.nodes[similar_node_id].relationships:
-                            state.nodes[similar_node_id].relationships[rel_type] = []
-                        state.nodes[similar_node_id].relationships[rel_type].extend(targets)
-                else:
-                    # If merged content would exceed limit, create new node
-                    node_id = node["suggested_id"]
-                    print(f"Creating new node {node_id} (merged content would exceed token limit)")
-                    state.nodes[node_id] = Node(
-                        content=node["content"],
-                        node_type=node["node_type"],
-                        relationships=node.get("relationships", {})
-                    )
+        # Process related content
+        for related in entity.get("related_content", []):
+            # Find or create node for related entity
+            related_nodes = [
+                (rid, n) for rid, n in state.nodes.items()
+                if n.title == f"{related['target_entity']}의 biology" or n.title == related['target_entity']
+            ]
+            
+            if related_nodes:
+                related_id, related_node = related_nodes[0]
+                # Add relationship
+                node.add_relationship(related_id, related["relationship_type"])
+                related_node.add_relationship(node_id, related["relationship_type"])
+                # Add content to related node
+                related_node.merge_content(related["content"], llm)
             else:
-                # Create new node
-                node_id = node["suggested_id"]
-                print(f"Creating new node {node_id}")
-                state.nodes[node_id] = Node(
-                    content=node["content"],
-                    node_type=node["node_type"],
-                    relationships=node.get("relationships", {})
+                # Create new related node
+                related_id = f"node_{len(state.nodes) + 1}"
+                related_node = Node(
+                    title=f"{related['target_entity']}의 biology",
+                    content=related["content"],
+                    node_type="person" if "biology" in f"{related['target_entity']}의 biology" else "concept"
                 )
-            
-    elif state.strategy["primary_strategy"] == "complement":
-        print("\nComplementing existing nodes...")
-        for related_node in state.classification["related_nodes"]:
-            node_id = related_node["node_id"]
-            if node_id in state.nodes:
-                print(f"Complementing node {node_id}")
-                print(f"Existing: {state.nodes[node_id].content}")
-                additional_content = related_node.get("conditions", "")
-                
-                # Merge content using LLM
-                merged_content = merge_contents(
-                    llm,
-                    state.nodes[node_id].content,
-                    additional_content
+                state.nodes[related_id] = related_node
+                # Add relationships
+                node.add_relationship(related_id, related["relationship_type"])
+                related_node.add_relationship(node_id, related["relationship_type"])
+    
+    # Process explicit node updates
+    for update in state.classification.get("node_updates", []):
+        if "node_id" in update and update["node_id"] in state.nodes:
+            # Update existing node
+            node = state.nodes[update["node_id"]]
+            node.merge_content(update["content"], llm)
+            # Update relationships
+            for rel in update.get("relationships", []):
+                node.add_relationship(
+                    rel["target_node_id"],
+                    rel["relationship_type"],
+                    rel.get("metadata")
                 )
-                
-                # Check if merged content would exceed token limit
-                if len(ENCODING.encode(merged_content)) <= MAX_TOKENS_PER_NODE:
-                    print(f"Adding merged content")
-                    state.nodes[node_id].content = merged_content
-                else:
-                    # If it would exceed, create a new node with a relationship
-                    new_node_id = f"{node_id}_continuation"
-                    print(f"Creating continuation node {new_node_id}")
-                    state.nodes[new_node_id] = Node(
-                        content=additional_content,
-                        node_type=state.nodes[node_id].node_type,
-                        relationships={"continues_from": [node_id]}
-                    )
-                    if "has_continuation" not in state.nodes[node_id].relationships:
-                        state.nodes[node_id].relationships["has_continuation"] = []
-                    state.nodes[node_id].relationships["has_continuation"].append(new_node_id)
-                
-    elif state.strategy["primary_strategy"] == "handle_contradiction":
-        print("\nHandling contradictions...")
-        for contradiction in state.classification["contradictions"]:
-            node_id = contradiction["node_id"]
-            if node_id in state.nodes:
-                print(f"Found {contradiction['contradiction_type']} contradiction for node {node_id}")
-                # Add contradiction information to metadata
-                state.nodes[node_id].metadata = state.nodes[node_id].metadata or {}
-                state.nodes[node_id].metadata["contradiction"] = {
-                    "type": contradiction["contradiction_type"],
-                    "conditions": contradiction["conditions"],
-                    "resolution_strategy": contradiction["resolution_strategy"]
-                }
-                
-                # If there are conditions, merge them with the content
-                if contradiction.get("conditions"):
-                    merged_content = merge_contents(
-                        llm,
-                        state.nodes[node_id].content,
-                        f"Under certain conditions: {contradiction['conditions']}"
-                    )
-                    
-                    if len(ENCODING.encode(merged_content)) <= MAX_TOKENS_PER_NODE:
-                        state.nodes[node_id].content = merged_content
-                    else:
-                        # Create a new node for conditions if token limit would be exceeded
-                        condition_node_id = f"{node_id}_conditions"
-                        state.nodes[condition_node_id] = Node(
-                            content=contradiction["conditions"],
-                            node_type=f"{state.nodes[node_id].node_type}_conditions",
-                            relationships={"conditions_for": [node_id]}
-                        )
-                        if "has_conditions" not in state.nodes[node_id].relationships:
-                            state.nodes[node_id].relationships["has_conditions"] = []
-                        state.nodes[node_id].relationships["has_conditions"].append(condition_node_id)
     
-    # Create relationships after handling the primary strategy
-    if "create_relationships" in state.strategy.get("sub_strategies", []):
-        print("\nCreating relationships...")
-        for node in state.classification["new_nodes"]:
-            node_id = node["suggested_id"]
-            if "relationships" in node:
-                for rel_type, target_nodes in node["relationships"].items():
-                    print(f"Creating {rel_type} relationship from {node_id} to {target_nodes}")
-                    if node_id in state.nodes:
-                        state.nodes[node_id].relationships = state.nodes[node_id].relationships or {}
-                        state.nodes[node_id].relationships[rel_type] = target_nodes
-    
-    # Check for potential overflow based on token count
-    for node_id, node in state.nodes.items():
-        if node.token_count() > MAX_TOKENS_PER_NODE:
-            print(f"\nToken limit exceeded in node {node_id}")
-            state.overflow_detected = True
-            state.action_result["overflow_node"] = node_id
-            break
+    # Create new nodes
+    for new_node in state.classification.get("new_nodes", []):
+        node_id = f"node_{len(state.nodes) + 1}"
+        node = Node(
+            title=new_node["title"],
+            content=new_node["content"],
+            node_type=new_node["node_type"]
+        )
+        # Add relationships
+        for rel in new_node.get("relationships", []):
+            node.add_relationship(
+                rel["target_node_id"],
+                rel["relationship_type"],
+                rel.get("metadata")
+            )
+        state.nodes[node_id] = node
     
     return state
 
