@@ -1,5 +1,6 @@
 from flask import Flask, render_template, request, jsonify
 from legal_doc_processor import create_legal_doc_processor, GraphState, Node, process_document_chunk
+from qa_agent import query_knowledge_graph
 
 app = Flask(__name__)
 
@@ -50,6 +51,19 @@ def process_chunk():
             'mermaid': mermaid_diagram,
             'nodes': len(current_state.nodes)
         })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/query', methods=['POST'])
+def query():
+    """Query the knowledge graph."""
+    query = request.json.get('query', '')
+    if not query:
+        return jsonify({'error': 'No query provided'}), 400
+    
+    try:
+        result = query_knowledge_graph(query)
+        return jsonify(result)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
