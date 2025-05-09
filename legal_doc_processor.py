@@ -13,6 +13,11 @@ from langchain.prompts import ChatPromptTemplate
 from langchain.schema import HumanMessage, SystemMessage
 from models import Node, NodeRelationship, NodeMetadata
 import uuid
+from langgraph.graph import StateGraph, END
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import JsonOutputParser
 
 # Load environment variables
 load_dotenv()
@@ -30,19 +35,95 @@ setup_sqlite_cache()
 MAX_TOKENS_PER_NODE = 1000  # Maximum tokens allowed in a single node before considering split
 ENCODING = tiktoken.get_encoding("cl100k_base")  # GPT-4's encoding
 
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import JsonOutputParser
-from langgraph.graph import StateGraph, END
+class Node:
+    """A node in the knowledge graph."""
+    def __init__(
+        self,
+        content: str,
+        node_type: str,
+        title: Optional[str] = None,
+        relationships: Optional[Dict[str, List[str]]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        created_at: Optional[str] = None,
+        updated_at: Optional[str] = None
+    ):
+        self.content = content
+        self.node_type = node_type
+        self.title = title or content[:50]  # Use first 50 chars as title if not provided
+        self.relationships = relationships or {}
+        self.metadata = metadata or {}
+        self.created_at = created_at or datetime.now().isoformat()
+        self.updated_at = updated_at or datetime.now().isoformat()
+
+    def merge_content(self, new_content: str) -> bool:
+        """Merge new content with existing content. Return True if content was updated."""
+        if new_content not in self.content:
+            self.content = f"{self.content}\n{new_content}"
+            self.updated_at = datetime.now().isoformat()
+            return True
+        return False
 
 class GraphState:
-    def __init__(self):
-        self.nodes: List[Node] = []
+    """State of the knowledge graph during processing."""
+    def __init__(
+        self,
+        nodes: Optional[Dict[str, Node]] = None,
+        current_chunk: Optional[str] = None,
+        classification: Optional[Dict[str, Any]] = None,
+        strategy: Optional[Dict[str, Any]] = None,
+        action_result: Optional[Dict[str, Any]] = None,
+        overflow_detected: bool = False
+    ):
+        self.nodes = nodes or {}
+        self.current_chunk = current_chunk or ""
+        self.classification = classification or {}
+        self.strategy = strategy or {}
+        self.action_result = action_result or {}
+        self.overflow_detected = overflow_detected
 
-    def add_node(self, node: Node) -> None:
-        """Add a node to the graph state."""
-        self.nodes.append(node)
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert the state to a dictionary."""
+        return {
+            "nodes": {
+                node_id: {
+                    "content": node.content,
+                    "node_type": node.node_type,
+                    "relationships": node.relationships,
+                    "metadata": node.metadata,
+                    "created_at": node.created_at,
+                    "updated_at": node.updated_at
+                }
+                for node_id, node in self.nodes.items()
+            },
+            "current_chunk": self.current_chunk,
+            "classification": self.classification,
+            "strategy": self.strategy,
+            "action_result": self.action_result,
+            "overflow_detected": self.overflow_detected
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'GraphState':
+        """Create a state from a dictionary."""
+        nodes = {}
+        for node_id, node_data in data.get("nodes", {}).items():
+            nodes[node_id] = Node(
+                content=node_data["content"],
+                node_type=node_data["node_type"],
+                relationships=node_data.get("relationships", {}),
+                metadata=node_data.get("metadata", {}),
+                created_at=node_data.get("created_at"),
+                updated_at=node_data.get("updated_at")
+            )
+        
+        return cls(
+            nodes=nodes,
+            current_chunk=data.get("current_chunk", ""),
+            classification=data.get("classification", {}),
+            strategy=data.get("strategy", {}),
+            action_result=data.get("action_result", {}),
+            overflow_detected=data.get("overflow_detected", False)
+        )
 
 # Classification Component
 def create_summary_chain(llm: ChatOpenAI):
@@ -81,7 +162,7 @@ def classify_chunk(state: GraphState) -> GraphState:
     
     # Prepare existing nodes for context - using metadata instead of full content
     nodes_context = []
-    for node in state.nodes:
+    for node in state.nodes.values():
         # If node doesn't have content summary in metadata, generate it
         if "content_summary" not in node.metadata:
             summary = summary_chain.invoke(node.content)
@@ -320,20 +401,20 @@ def implement_action(state: GraphState) -> Union[GraphState, Dict]:
             node_type=entity.get("type", "concept"),
             metadata={"content_summary": entity["content_summary"]}
         )
-        state.add_node(node)
+        state.nodes[node_id] = node
         
         # Process related content
         for related in entity.get("related_content", []):
             # Find or create node for related entity
             related_nodes = [
-                (rid, n) for rid, n in state.nodes if n.title == related['target_entity']
+                (rid, n) for rid, n in state.nodes.items() if n.title == related['target_entity']
             ]
             
             if related_nodes:
                 related_id, related_node = related_nodes[0]
                 # Add relationship
-                node.add_relationship(related_id, related["relationship_type"])
-                related_node.add_relationship(node_id, related["relationship_type"])
+                node.relationships[related_id] = related["relationship_type"]
+                related_node.relationships[node_id] = related["relationship_type"]
                 # Add content to related node
                 if related_node.merge_content(related["content"]):
                     # Update content summary in metadata
@@ -353,10 +434,10 @@ def implement_action(state: GraphState) -> Union[GraphState, Dict]:
                         "attributes": {}
                     }}
                 )
-                state.add_node(related_node)
+                state.nodes[related_id] = related_node
                 # Add relationships
-                node.add_relationship(related_id, related["relationship_type"])
-                related_node.add_relationship(node_id, related["relationship_type"])
+                node.relationships[related_id] = related["relationship_type"]
+                related_node.relationships[node_id] = related["relationship_type"]
                 
                 # Generate content summary
                 summary = summary_chain.invoke(related_node.content)
@@ -366,20 +447,16 @@ def implement_action(state: GraphState) -> Union[GraphState, Dict]:
     for update in state.classification.get("node_updates", []):
         if "node_id" in update and update["node_id"] in state.nodes:
             # Update existing node
-            node = state.get_node_by_id(update["node_id"])
+            node = state.nodes[update["node_id"]]
             if node.merge_content(update["content"]):
                 # Update content summary in metadata
                 node.metadata["content_summary"] = update["content_summary"]
             # Update relationships
             for rel in update.get("relationships", []):
-                node.add_relationship(
-                    rel["target_node_id"],
-                    rel["relationship_type"],
-                    rel.get("metadata")
-                )
+                node.relationships[rel["target_node_id"]] = rel["relationship_type"]
     
     # After processing nodes, store them in Supabase
-    for node_id, node in state.nodes:
+    for node_id, node in state.nodes.items():
         store_node_in_supabase(node_id, node)
     
     return state
@@ -392,7 +469,7 @@ def manage_context(state: GraphState) -> GraphState:
     
     llm = ChatOpenAI(temperature=0, model="gpt-4")
     node_id = state.action_result["overflow_node"]
-    node = state.get_node_by_id(node_id)
+    node = state.nodes[node_id]
     
     split_prompt = ChatPromptTemplate.from_template("""
     Analyze this content and determine how to split it into coherent sections while maintaining semantic meaning.
@@ -443,19 +520,19 @@ def manage_context(state: GraphState) -> GraphState:
     for section in result["sections"]:
         if len(ENCODING.encode(section["content"])) > 0:  # Only create node if there's content
             section_id = f"{node_id}_continuation_{len(node.relationships.get('has_continuation', []))}"
-            state.add_node(Node(
+            state.nodes[section_id] = Node(
                 title=section["title"],
                 content=section["content"],
                 node_type=node.node_type,
                 relationships={"continues_from": [current_node.id if hasattr(current_node, 'id') else node_id]},
                 metadata={"title": section["title"]}
-            ))
+            )
             
             # Update relationships
             if "has_continuation" not in current_node.relationships:
                 current_node.relationships["has_continuation"] = []
             current_node.relationships["has_continuation"].append(section_id)
-            current_node = state.get_node_by_id(section_id)
+            current_node = state.nodes[section_id]
     
     state.overflow_detected = False
     state.action_result["context_managed"] = True
@@ -480,7 +557,7 @@ def handle_user_input(state: GraphState, user_input: str) -> GraphState:
                 state = implement_action(state)
             else:
                 # User provided direct resolution - update node
-                node = state.get_node_by_id(node_id)
+                node = state.nodes[node_id]
                 node.content = user_input
                 node.updated_at = datetime.now().isoformat()
             
@@ -619,8 +696,7 @@ Please analyze the text and suggest how to update the graph."""
         node = Node(
             id=node_data["id"],
             title=node_data["title"],
-            type=node_data["type"],
-            summary=node_data["summary"],
+            node_type=node_data["type"],
             relationships=relationships,
             metadata=NodeMetadata(
                 content_summary={},
@@ -629,7 +705,7 @@ Please analyze the text and suggest how to update the graph."""
         )
         
         # Add the node to the graph state
-        state.add_node(node)
+        state.nodes[node_data["id"]] = node
         
         # Print success message
         print(f"Successfully stored/updated node {node.id} in Supabase")
@@ -642,10 +718,10 @@ if __name__ == "__main__":
     
     # Initialize state with example nodes
     initial_state = GraphState()
-    initial_state.add_node(Node(
+    initial_state.nodes["node_1"] = Node(
         content="Corporate tax deductions are allowable for ordinary and necessary business expenses incurred during the taxable year.",
         node_type="tax_regulation"
-    ))
+    )
     
     # Example chunk to process
     example_chunk = """
@@ -660,7 +736,7 @@ if __name__ == "__main__":
     
     # Print results
     print("\nProcessed Knowledge Graph:")
-    for node in initial_state.nodes:
-        print(f"\nNode {node.id} ({node.node_type}):")
+    for node_id, node in initial_state.nodes.items():
+        print(f"\nNode {node_id} ({node.node_type}):")
         print(f"Content: {node.content}")
         print("Relationships:", node.relationships) 

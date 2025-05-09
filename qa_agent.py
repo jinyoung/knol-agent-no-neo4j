@@ -21,13 +21,13 @@ supabase: Client = create_client(
     os.getenv("SUPABASE_KEY", "")
 )
 
-def query_knowledge_graph(query: str, nodes: List[Node]) -> Dict[str, Any]:
+def query_knowledge_graph(query: str, nodes: Dict[str, Node]) -> Dict[str, Any]:
     """
     Query the knowledge graph with a given question and return the answer.
     
     Args:
         query: The question to ask
-        nodes: List of nodes in the knowledge graph
+        nodes: Dictionary of nodes in the knowledge graph
         
     Returns:
         Dictionary containing:
@@ -49,32 +49,19 @@ def query_knowledge_graph(query: str, nodes: List[Node]) -> Dict[str, Any]:
 }
 
 신뢰도 점수는 답변의 정확성과 완성도를 기반으로 0.0에서 1.0 사이의 값으로 설정해주세요.
-답변에 사용된 모든 정보는 반드시 주어진 노드들의 내용에 기반해야 합니다.
-
-노드 ID는 UUID 형식이므로, 답변에서는 노드의 제목을 사용해주세요."""
+답변에 사용된 모든 정보는 반드시 주어진 노드들의 내용에 기반해야 합니다."""
 
     # Convert nodes to a list of dictionaries
     nodes_data = []
-    for node in nodes:
+    for node_id, node in nodes.items():
         node_data = {
-            'id': node.id,  # Now using UUID-based ID
-            'title': node.title,
-            'type': node.type,
-            'summary': node.summary
+            'id': node_id,
+            'title': node.title if hasattr(node, 'title') else node.content[:50],
+            'type': node.node_type,
+            'content': node.content,
+            'relationships': node.relationships,
+            'metadata': node.metadata
         }
-        
-        # Handle relationships with UUID-based IDs
-        relationships = {}
-        for rel_type, rel_list in node.relationships.items():
-            relationships[rel_type] = []
-            for rel in rel_list:
-                rel_data = {
-                    'node_id': rel.node_id,  # UUID-based ID
-                    'additional': rel.additional if rel.additional else ''
-                }
-                relationships[rel_type].append(rel_data)
-        node_data['relationships'] = relationships
-        
         nodes_data.append(node_data)
 
     human_prompt = f"""질문: {query}

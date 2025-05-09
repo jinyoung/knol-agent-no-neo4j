@@ -6,7 +6,7 @@ app = Flask(__name__)
 
 # Initialize the processor and state
 processor = create_legal_doc_processor()
-current_state = GraphState(nodes={})
+current_state = GraphState()
 
 def convert_to_mermaid(state: GraphState) -> str:
     """Convert the knowledge graph state to Mermaid diagram format."""
@@ -57,15 +57,21 @@ def process_chunk():
 @app.route('/query', methods=['POST'])
 def query():
     """Query the knowledge graph."""
+    global current_state
+    
     query = request.json.get('query', '')
     if not query:
         return jsonify({'error': 'No query provided'}), 400
     
     try:
-        result = query_knowledge_graph(query)
+        result = query_knowledge_graph(query, current_state.nodes)
         return jsonify(result)
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        import traceback
+        error_trace = traceback.format_exc()
+        print("\nError occurred while processing query:")
+        print(error_trace)
+        return jsonify({'error': f'Error processing query: {str(e)}', 'trace': error_trace}), 500
 
 if __name__ == '__main__':
     app.run(debug=True) 
