@@ -1,84 +1,57 @@
-# Legal Document Processor with LangGraph
+# Legal Document Knowledge Graph Visualizer
 
-This project implements a LangGraph-based agent for processing legal documents, particularly focusing on tax regulations. The agent can analyze document chunks, maintain a knowledge graph, and handle various types of information relationships and contradictions.
+This web application processes legal document chunks and visualizes the knowledge graph using Mermaid diagrams. It helps in understanding relationships and connections between different parts of legal documents.
 
 ## Features
 
-- **Cohesion-based Classification**: Analyzes new information to determine relationships with existing knowledge
-- **Smart Merge Strategies**: Handles complementary information, contradictions, and cross-references
-- **Polymorphic Node Management**: Creates variant nodes for conditional information
-- **Context Overflow Management**: Splits large nodes into coherent subsections
-- **Relationship Tracking**: Maintains relationships between different pieces of information
+- Process text chunks from legal documents
+- Automatically extract relationships and concepts
+- Visualize the knowledge graph in real-time
+- Interactive web interface
+- Mermaid-based graph visualization
 
-## Requirements
+## Setup
 
-- Python 3.9 or higher
-- uv (for dependency management)
-- OpenAI API key (for GPT-4 access)
-
-## Installation
-
-1. Clone the repository:
+1. Install dependencies:
 ```bash
-git clone <repository-url>
-cd legal-doc-processor
+pip install -r requirements.txt
 ```
 
-2. Install dependencies using uv:
-```bash
-uv venv
-source .venv/bin/activate  # On Unix/macOS
-.venv\Scripts\activate     # On Windows
-uv pip install -r requirements.txt
+2. Set up environment variables:
+Create a `.env` file with your OpenAI API key:
+```
+OPENAI_API_KEY=your_api_key_here
 ```
 
-3. Set up your OpenAI API key:
+3. Run the application:
 ```bash
-export OPENAI_API_KEY='your-api-key-here'
+python app.py
+```
+
+4. Open your browser and navigate to:
+```
+http://localhost:5000
 ```
 
 ## Usage
 
-The main components are:
+1. Enter a chunk of legal text in the input box
+2. Click "Process Chunk" to add it to the knowledge graph
+3. The graph will update automatically to show new nodes and relationships
+4. Continue adding chunks to build a comprehensive knowledge graph
 
-1. `legal_doc_processor.py`: Contains the core LangGraph agent implementation
-2. `test_legal_doc_processor.py`: Provides example usage with tax regulation documents
+## Technical Details
 
-To run the example:
+- Built with Flask
+- Uses OpenAI's GPT-4 for text analysis
+- Mermaid.js for graph visualization
+- Tailwind CSS for styling
 
-```bash
-python test_legal_doc_processor.py
-```
+## Requirements
 
-### Processing Your Own Documents
-
-```python
-from legal_doc_processor import create_legal_doc_processor, GraphState, Node, process_document_chunk
-
-# Create the processor
-processor = create_legal_doc_processor()
-
-# Initialize state
-initial_state = GraphState(
-    nodes={
-        "node_1": Node(
-            content="Your initial content",
-            node_type="your_content_type"
-        )
-    }
-)
-
-# Process document chunks
-chunks = [
-    "Your first chunk of text",
-    "Your second chunk of text",
-    # ...
-]
-
-current_state = initial_state
-for chunk in chunks:
-    current_state = process_document_chunk(processor, current_state, chunk)
-```
+- Python 3.8+
+- OpenAI API key
+- Modern web browser
 
 ## How It Works
 
