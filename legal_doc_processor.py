@@ -9,6 +9,7 @@ from llm_cache import setup_sqlite_cache
 import tiktoken
 from supabase import create_client, Client
 import uuid
+from langchain_openai import OpenAIEmbeddings
 
 # Load environment variables
 load_dotenv()
@@ -369,6 +370,9 @@ def merge_contents(llm: ChatOpenAI, existing_content: str, new_content: str) -> 
     result = merge_chain.invoke([existing_content, new_content])
     return result.content
 
+# Initialize embeddings model
+embeddings = OpenAIEmbeddings()
+
 def store_node_in_supabase(node_id: str, node: Node) -> None:
     """Store a node in Supabase database.
     
@@ -377,6 +381,9 @@ def store_node_in_supabase(node_id: str, node: Node) -> None:
         node (Node): The node object to store
     """
     try:
+        # Generate embedding for the node content
+        embedding = embeddings.embed_query(node.content)
+        
         node_data = {
             "id": node_id,
             "title": node.title,
@@ -385,7 +392,8 @@ def store_node_in_supabase(node_id: str, node: Node) -> None:
             "relationships": json.dumps(node.relationships),
             "metadata": json.dumps(node.metadata),
             "created_at": node.created_at,
-            "updated_at": node.updated_at
+            "updated_at": node.updated_at,
+            "embedding": embedding
         }
         
         # Upsert the node data
