@@ -8,6 +8,7 @@ from langgraph.pregel import Graph
 from llm_cache import setup_sqlite_cache
 import tiktoken
 from supabase import create_client, Client
+import uuid
 
 # Load environment variables
 load_dotenv()
@@ -408,7 +409,7 @@ def implement_action(state: GraphState) -> Union[GraphState, Dict]:
     # Process new entities
     for entity in state.classification.get("entities", []):
         # Create new node
-        node_id = f"node_{len(state.nodes) + 1}"
+        node_id = str(uuid.uuid4())
         node = Node(
             title=entity["node_title"],
             content=entity["primary_content"],
@@ -437,7 +438,7 @@ def implement_action(state: GraphState) -> Union[GraphState, Dict]:
                     related_node.metadata["content_summary"] = summary
             else:
                 # Create new related node
-                related_id = f"node_{len(state.nodes) + 1}"
+                related_id = str(uuid.uuid4())
                 related_node = Node(
                     title=related['target_entity'],
                     content=related["content"],
