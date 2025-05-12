@@ -8,16 +8,8 @@ from langgraph.pregel import Graph
 from llm_cache import setup_sqlite_cache
 import tiktoken
 from supabase import create_client, Client
-from langchain_community.chat_models import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-from langchain.schema import HumanMessage, SystemMessage
-from models import Node, NodeRelationship, NodeMetadata
 import uuid
-from langgraph.graph import StateGraph, END
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import JsonOutputParser
+from langchain_openai import OpenAIEmbeddings
 
 # Load environment variables
 load_dotenv()
@@ -35,51 +27,75 @@ setup_sqlite_cache()
 MAX_TOKENS_PER_NODE = 1000  # Maximum tokens allowed in a single node before considering split
 ENCODING = tiktoken.get_encoding("cl100k_base")  # GPT-4's encoding
 
-class Node:
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import JsonOutputParser
+from langgraph.graph import StateGraph, END
+
+# Define data structures
+class Node(BaseModel):
     """A node in the knowledge graph."""
-    def __init__(
-        self,
-        content: str,
-        node_type: str,
-        title: Optional[str] = None,
-        relationships: Optional[Dict[str, List[str]]] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        created_at: Optional[str] = None,
-        updated_at: Optional[str] = None
-    ):
-        self.content = content
-        self.node_type = node_type
-        self.title = title or content[:50]  # Use first 50 chars as title if not provided
-        self.relationships = relationships or {}
-        self.metadata = metadata or {}
-        self.created_at = created_at or datetime.now().isoformat()
-        self.updated_at = updated_at or datetime.now().isoformat()
+    title: str
+    content: str
+    node_type: str
+    relationships: Dict[str, List[Dict[str, str]]] = {}  # Changed to support richer relationship data
+    metadata: Dict[str, Any] = {}
+    created_at: str = ""
+    updated_at: str = ""
 
-    def merge_content(self, new_content: str) -> bool:
-        """Merge new content with existing content. Return True if content was updated."""
-        if new_content not in self.content:
+    def __init__(self, **data):
+        if "created_at" not in data:
+            data["created_at"] = datetime.now().isoformat()
+        if "updated_at" not in data:
+            data["updated_at"] = datetime.now().isoformat()
+        if "relationships" not in data:
+            data["relationships"] = {}
+        super().__init__(**data)
+    
+    def token_count(self) -> int:
+        """Calculate the number of tokens in the node's content."""
+        return len(ENCODING.encode(self.content))
+
+    def would_exceed_token_limit(self, additional_content: str) -> bool:
+        """Check if adding the content would exceed the token limit."""
+        combined_content = self.content + "\n" + additional_content
+        return len(ENCODING.encode(combined_content)) > MAX_TOKENS_PER_NODE
+
+    def add_relationship(self, target_node_id: str, relationship_type: str, metadata: Optional[Dict[str, str]] = None):
+        """Add a relationship to another node with optional metadata."""
+        if relationship_type not in self.relationships:
+            self.relationships[relationship_type] = []
+        
+        rel_data = {"node_id": target_node_id}
+        if metadata:
+            rel_data.update(metadata)
+            
+        if rel_data not in self.relationships[relationship_type]:
+            self.relationships[relationship_type].append(rel_data)
+            
+    def merge_content(self, new_content: str, llm: Optional[ChatOpenAI] = None) -> bool:
+        """Merge new content into the node, optionally using LLM for better merging."""
+        if self.would_exceed_token_limit(new_content):
+            return False
+            
+        if llm:
+            merged = merge_contents(llm, self.content, new_content)
+            self.content = merged
+        else:
             self.content = f"{self.content}\n{new_content}"
-            self.updated_at = datetime.now().isoformat()
-            return True
-        return False
+            
+        self.updated_at = datetime.now().isoformat()
+        return True
 
-class GraphState:
+class GraphState(BaseModel):
     """State of the knowledge graph during processing."""
-    def __init__(
-        self,
-        nodes: Optional[Dict[str, Node]] = None,
-        current_chunk: Optional[str] = None,
-        classification: Optional[Dict[str, Any]] = None,
-        strategy: Optional[Dict[str, Any]] = None,
-        action_result: Optional[Dict[str, Any]] = None,
-        overflow_detected: bool = False
-    ):
-        self.nodes = nodes or {}
-        self.current_chunk = current_chunk or ""
-        self.classification = classification or {}
-        self.strategy = strategy or {}
-        self.action_result = action_result or {}
-        self.overflow_detected = overflow_detected
+    nodes: Dict[str, Node] = {}
+    current_chunk: str = ""
+    classification: Dict[str, Any] = {}
+    strategy: Dict[str, Any] = {}
+    action_result: Dict[str, Any] = {}
+    overflow_detected: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert the state to a dictionary."""
@@ -153,8 +169,8 @@ def create_summary_chain(llm: ChatOpenAI):
     )
 
 def classify_chunk(state: GraphState) -> GraphState:
-    """Classifies new chunk to determine relevance and relationships."""
-    print("\nClassifying chunk...")
+    """Classifies new chunk and determines strategy in one step."""
+    print("\nClassifying chunk and determining strategy...")
     llm = ChatOpenAI(temperature=0, model="gpt-4")
     
     # Create summary chain
@@ -162,14 +178,14 @@ def classify_chunk(state: GraphState) -> GraphState:
     
     # Prepare existing nodes for context - using metadata instead of full content
     nodes_context = []
-    for node in state.nodes.values():
+    for node_id, node in state.nodes.items():
         # If node doesn't have content summary in metadata, generate it
         if "content_summary" not in node.metadata:
             summary = summary_chain.invoke(node.content)
             node.metadata["content_summary"] = summary
 
         nodes_context.append({
-            "id": node.id,
+            "id": node_id,
             "title": node.title,
             "type": node.node_type,
             "summary": node.metadata.get("content_summary", {}),
@@ -198,6 +214,7 @@ def classify_chunk(state: GraphState) -> GraphState:
     2. How the information relates to existing nodes (using their summaries for comparison)
     3. Whether information should be merged into existing nodes or create new ones
     4. What relationships exist between different concepts/entities
+    5. The best strategy for incorporating this information
     
     Consider these STRICT guidelines for node creation and updates:
     1. Node Consolidation Rules:
@@ -219,33 +236,11 @@ def classify_chunk(state: GraphState) -> GraphState:
     
     Return your analysis as JSON:
     {{
-        "entities": [
-            {{
-                "name": "concept/entity name",
-                "type": "concept|process|term|principle|other",
-                "node_title": "concise representative title",
-                "primary_content": "main content about this concept",
-                "content_summary": {{
-                    "key_points": ["point 1", "point 2"],
-                    "entities": ["entity1", "entity2"],
-                    "topics": ["topic1", "topic2"],
-                    "attributes": {{
-                        "attribute1": "value1"
-                    }}
-                }},
-                "related_content": [
-                    {{
-                        "target_entity": "name of related concept",
-                        "content": "content describing the relationship",
-                        "relationship_type": "type of relationship"
-                    }}
-                ]
-            }}
-        ],
         "node_updates": [
             {{
-                "node_id": "existing node id to update",
+                "node_id": "existing node id to update, or 'new' for new nodes",
                 "title": "node title",
+                "type": "concept|process|term|principle|other",
                 "content": "content to add or merge",
                 "content_summary": {{
                     "key_points": ["point 1", "point 2"],
@@ -257,15 +252,23 @@ def classify_chunk(state: GraphState) -> GraphState:
                 }},
                 "relationships": [
                     {{
-                        "target_node_id": "id of target node",
+                        "target_node_id": "id of target node or title for new nodes",
                         "relationship_type": "type of relationship",
+                        "content": "content describing the relationship",
                         "metadata": {{
                             "additional": "relationship metadata"
                         }}
                     }}
                 ]
             }}
-        ]
+        ],
+        "strategy": {{
+            "primary_strategy": "add_new|complement|handle_contradiction|create_relationships|split_node",
+            "sub_strategies": ["additional strategies if needed"],
+            "rationale": "explanation of the chosen strategy",
+            "execution_order": ["ordered list of steps to take"],
+            "contradiction_query": "question for user if contradiction detected"
+        }}
     }}
     """)
     
@@ -278,7 +281,9 @@ def classify_chunk(state: GraphState) -> GraphState:
         | JsonOutputParser()
     )
     
-    state.classification = classification_chain.invoke(state)
+    result = classification_chain.invoke(state)
+    state.classification = result
+    state.strategy = result["strategy"]
     return state
 
 # Strategy Selection Component
@@ -354,6 +359,9 @@ def merge_contents(llm: ChatOpenAI, existing_content: str, new_content: str) -> 
     result = merge_chain.invoke([existing_content, new_content])
     return result.content
 
+# Initialize embeddings model
+embeddings = OpenAIEmbeddings()
+
 def store_node_in_supabase(node_id: str, node: Node) -> None:
     """Store a node in Supabase database.
     
@@ -362,6 +370,9 @@ def store_node_in_supabase(node_id: str, node: Node) -> None:
         node (Node): The node object to store
     """
     try:
+        # Generate embedding for the node content
+        embedding = embeddings.embed_query(node.content)
+        
         node_data = {
             "id": node_id,
             "title": node.title,
@@ -370,7 +381,8 @@ def store_node_in_supabase(node_id: str, node: Node) -> None:
             "relationships": json.dumps(node.relationships),
             "metadata": json.dumps(node.metadata),
             "created_at": node.created_at,
-            "updated_at": node.updated_at
+            "updated_at": node.updated_at,
+            "embedding": embedding
         }
         
         # Upsert the node data
@@ -391,69 +403,57 @@ def implement_action(state: GraphState) -> Union[GraphState, Dict]:
     llm = ChatOpenAI(temperature=0, model="gpt-4")
     summary_chain = create_summary_chain(llm)
     
-    # Process new entities
-    for entity in state.classification.get("entities", []):
-        # Create new node
-        node_id = f"node_{str(uuid.uuid4())}"
-        node = Node(
-            title=entity["node_title"],
-            content=entity["primary_content"],
-            node_type=entity.get("type", "concept"),
-            metadata={"content_summary": entity["content_summary"]}
-        )
-        state.nodes[node_id] = node
-        
-        # Process related content
-        for related in entity.get("related_content", []):
-            # Find or create node for related entity
-            related_nodes = [
-                (rid, n) for rid, n in state.nodes.items() if n.title == related['target_entity']
-            ]
-            
-            if related_nodes:
-                related_id, related_node = related_nodes[0]
-                # Add relationship
-                node.relationships[related_id] = related["relationship_type"]
-                related_node.relationships[node_id] = related["relationship_type"]
-                # Add content to related node
-                if related_node.merge_content(related["content"]):
-                    # Update content summary in metadata
-                    summary = summary_chain.invoke(related_node.content)
-                    related_node.metadata["content_summary"] = summary
-            else:
-                # Create new related node
-                related_id = f"node_{str(uuid.uuid4())}"
-                related_node = Node(
-                    title=related['target_entity'],
-                    content=related["content"],
-                    node_type=entity.get("type", "concept"),
-                    metadata={"content_summary": {
-                        "key_points": [],
-                        "entities": [],
-                        "topics": [],
-                        "attributes": {}
-                    }}
-                )
-                state.nodes[related_id] = related_node
-                # Add relationships
-                node.relationships[related_id] = related["relationship_type"]
-                related_node.relationships[node_id] = related["relationship_type"]
-                
-                # Generate content summary
-                summary = summary_chain.invoke(related_node.content)
-                related_node.metadata["content_summary"] = summary
+    # Process all node updates (both new and existing nodes)
+    node_updates = state.classification.get("node_updates", [])
+    node_id_mapping = {}  # Maps temporary titles to actual node IDs
     
-    # Process explicit node updates
-    for update in state.classification.get("node_updates", []):
-        if "node_id" in update and update["node_id"] in state.nodes:
+    for update in node_updates:
+        is_new_node = update.get("node_id") == "new"
+        node_id = str(uuid.uuid4()) if is_new_node else update["node_id"]
+        
+        # Store mapping for new nodes
+        if is_new_node:
+            node_id_mapping[update["title"]] = node_id
+            
+        # Create or update node
+        if is_new_node or node_id not in state.nodes:
+            # Create new node
+            node = Node(
+                title=update["title"],
+                content=update["content"],
+                node_type=update.get("type", "concept"),
+                metadata={"content_summary": update["content_summary"]}
+            )
+            state.nodes[node_id] = node
+        else:
             # Update existing node
-            node = state.nodes[update["node_id"]]
+            node = state.nodes[node_id]
             if node.merge_content(update["content"]):
-                # Update content summary in metadata
                 node.metadata["content_summary"] = update["content_summary"]
-            # Update relationships
-            for rel in update.get("relationships", []):
-                node.relationships[rel["target_node_id"]] = rel["relationship_type"]
+        
+        # Process relationships after all nodes are created/updated
+        for rel in update.get("relationships", []):
+            target_id = rel["target_node_id"]
+            # If target is a new node, use the mapped ID
+            if target_id not in state.nodes and target_id in node_id_mapping:
+                target_id = node_id_mapping[target_id]
+                
+            if target_id in state.nodes:
+                # Add relationship
+                node.add_relationship(
+                    target_id,
+                    rel["relationship_type"],
+                    rel.get("metadata")
+                )
+                # Add reverse relationship if it exists
+                target_node = state.nodes[target_id]
+                if rel.get("content"):
+                    target_node.merge_content(rel["content"])
+                target_node.add_relationship(
+                    node_id,
+                    rel["relationship_type"],
+                    rel.get("metadata")
+                )
     
     # After processing nodes, store them in Supabase
     for node_id, node in state.nodes.items():
@@ -521,10 +521,9 @@ def manage_context(state: GraphState) -> GraphState:
         if len(ENCODING.encode(section["content"])) > 0:  # Only create node if there's content
             section_id = f"{node_id}_continuation_{len(node.relationships.get('has_continuation', []))}"
             state.nodes[section_id] = Node(
-                title=section["title"],
                 content=section["content"],
                 node_type=node.node_type,
-                relationships={"continues_from": [current_node.id if hasattr(current_node, 'id') else node_id]},
+                relationships={"continues_from": [current_node.node_id if hasattr(current_node, 'node_id') else node_id]},
                 metadata={"title": section["title"]}
             )
             
@@ -557,9 +556,8 @@ def handle_user_input(state: GraphState, user_input: str) -> GraphState:
                 state = implement_action(state)
             else:
                 # User provided direct resolution - update node
-                node = state.nodes[node_id]
-                node.content = user_input
-                node.updated_at = datetime.now().isoformat()
+                state.nodes[node_id].content = user_input
+                state.nodes[node_id].updated_at = datetime.now().isoformat()
             
             state.strategy["contradiction_query"] = None
     
@@ -575,152 +573,191 @@ def should_continue(state: GraphState) -> Literal["user_input", "continue", "end
     return "end"
 
 # Create the LangGraph
-def create_legal_doc_processor() -> ChatOpenAI:
-    """Create and return the language model for document processing."""
-    return ChatOpenAI(
-        model_name="gpt-4-turbo-preview",
-        temperature=0
+def create_legal_doc_processor() -> Any:
+    """Creates the legal document processing workflow."""
+    # Create the graph
+    workflow = StateGraph(GraphState)
+    
+    # Add nodes
+    workflow.add_node("classify", classify_chunk)
+    workflow.add_node("implement_action", implement_action)
+    workflow.add_node("manage_context", manage_context)
+    workflow.add_node("handle_user_input", RunnablePassthrough())
+    
+    # Add edges starting from classify
+    workflow.add_edge("classify", "implement_action")
+    
+    # Set the entry point
+    workflow.set_entry_point("classify")
+    
+    # Add conditional edges
+    workflow.add_conditional_edges(
+        "implement_action",
+        should_continue,
+        {
+            "user_input": "handle_user_input",
+            "continue": "manage_context",
+            "end": END
+        }
     )
+    
+    workflow.add_edge("handle_user_input", "implement_action")
+    workflow.add_edge("manage_context", END)
+    
+    # Compile the graph
+    return workflow.compile()
+
+def load_existing_nodes() -> Dict[str, Node]:
+    """Load existing nodes from Supabase with minimal information."""
+    try:
+        # Query Supabase for node titles and metadata
+        response = supabase.table("nodes").select("id", "title", "node_type", "relationships", "metadata").execute()
+        
+        nodes = {}
+        if response.data:
+            for node_data in response.data:
+                # Create Node object with minimal information
+                nodes[node_data['id']] = Node(
+                    title=node_data['title'],
+                    content="",  # Empty content since we don't need it for classification
+                    node_type=node_data['node_type'],
+                    relationships=json.loads(node_data.get('relationships', '{}')),
+                    metadata=json.loads(node_data.get('metadata', '{}'))
+                )
+        return nodes
+    except Exception as e:
+        print(f"Error loading nodes from Supabase: {str(e)}")
+        return {}
 
 # Example usage
-def process_document_chunk(chunk: str, state: GraphState) -> None:
-    """
-    Process a chunk of text and update the graph state.
+def process_document_chunk(processor: Graph, state: GraphState, chunk: str) -> GraphState:
+    """Process a single chunk of the document."""
+    # Load existing nodes if state is empty
+    if not state.nodes:
+        state.nodes = load_existing_nodes()
     
-    Args:
-        chunk: The text chunk to process
-        state: The current graph state
-    """
-    print("Classifying chunk...")
-    print(f"Existing nodes: {state.nodes}\n")
+    # Create a new state with the current chunk
+    current_state = GraphState(
+        nodes=state.nodes.copy(),
+        current_chunk=chunk
+    )
     
-    # Create the chat model
-    chat = create_legal_doc_processor()
+    # Invoke the processor with the current state
+    result = processor.invoke(current_state)
     
-    # Create the system prompt
-    system_prompt = """You are a document processor that analyzes text chunks and updates a knowledge graph.
-Your task is to:
-1. Identify key entities, relationships, and information in the text
-2. Create or update nodes in the knowledge graph
-3. Establish relationships between nodes
-
-The text is in Korean and contains information about a company.
-Analyze the text and create appropriate nodes and relationships.
-
-IMPORTANT: You must ONLY return a JSON object with no additional text or explanation.
-The JSON object must have these fields:
-{
-    "nodes": [
-        {
-            "id": "will_be_replaced_with_uuid",
-            "title": "Node title",
-            "type": "company|person|product|team|location|financial",
-            "summary": {
-                "key_points": ["Point 1", "Point 2"],
-                "entities": ["Entity 1", "Entity 2"],
-                "topics": ["Topic 1", "Topic 2"],
-                "attributes": {
-                    "attribute1": "value1",
-                    "attribute2": "value2"
-                }
-            },
-            "relationships": {
-                "relationship_type": [
-                    {
-                        "node_id": "will_be_replaced_with_uuid",
-                        "additional": "Optional additional info"
-                    }
-                ]
-            }
-        }
-    ]
-}"""
-
-    # Create the human prompt
-    human_prompt = f"""Text chunk to process:
-{chunk}
-
-Current nodes in the graph:
-{state.nodes}
-
-Please analyze the text and suggest how to update the graph."""
-
-    # Create messages
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=human_prompt)
-    ]
-    
-    print("Selecting strategy...")
-    print("\nRunning strategy selection...")
-    
-    # Get the response
-    response = chat.invoke(messages)
-    print(f"Strategy result: {response.content}\n")
-    
-    print("Implementing action...")
-    
-    # Parse the response
-    import json
-    import re
-    
-    # Remove ```json and ``` tags if present
-    content = re.sub(r'```json\s*|\s*```', '', response.content)
-    result = json.loads(content)
-    
-    # Create a mapping of temporary IDs to UUIDs
-    id_mapping = {}
-    
-    # First pass: generate UUIDs for all nodes
-    for node_data in result["nodes"]:
-        temp_id = node_data["id"]
-        id_mapping[temp_id] = f"node_{str(uuid.uuid4())}"
-    
-    # Create or update nodes based on the analysis
-    for node_data in result["nodes"]:
-        # Replace the temporary ID with UUID
-        node_data["id"] = id_mapping[node_data["id"]]
-        
-        # Update relationship node IDs with UUIDs
-        relationships = {}
-        for rel_type, rel_list in node_data.get("relationships", {}).items():
-            relationships[rel_type] = [
-                NodeRelationship(
-                    node_id=id_mapping.get(rel["node_id"], rel["node_id"]),  # Use existing UUID if not in mapping
-                    additional=rel.get("additional", "") or ""  # Convert None to empty string
+    # If result is not a GraphState, convert it
+    if not isinstance(result, GraphState):
+        # Create a new nodes dictionary
+        nodes = {}
+        # Convert each node in the result
+        for node_id, node_data in result.get("nodes", {}).items():
+            if isinstance(node_data, Node):
+                nodes[node_id] = node_data
+            else:
+                nodes[node_id] = Node(
+                    title=node_data.get("title", ""),
+                    content=node_data.get("content", ""),
+                    node_type=node_data.get("node_type", "unknown"),
+                    relationships=node_data.get("relationships", {}),
+                    metadata=node_data.get("metadata", {}),
+                    created_at=node_data.get("created_at", datetime.now().isoformat()),
+                    updated_at=node_data.get("updated_at", datetime.now().isoformat())
                 )
-                for rel in rel_list
-            ]
         
-        # Create node
-        node = Node(
-            id=node_data["id"],
-            title=node_data["title"],
-            node_type=node_data["type"],
-            relationships=relationships,
-            metadata=NodeMetadata(
-                content_summary={},
-                attributes={}
-            )
+        # Create a new state with the converted nodes
+        result = GraphState(
+            nodes=nodes,
+            current_chunk=result.get("current_chunk", chunk),
+            classification=result.get("classification", {}),
+            strategy=result.get("strategy", {}),
+            action_result=result.get("action_result", {}),
+            overflow_detected=result.get("overflow_detected", False)
         )
-        
-        # Add the node to the graph state
-        state.nodes[node_data["id"]] = node
-        
-        # Print success message
-        print(f"Successfully stored/updated node {node.id} in Supabase")
     
-    print("\nMerging similar nodes...\n")
+    # Merge similar nodes after processing
+    result = merge_similar_nodes(result)
+    
+    return result
+
+def merge_similar_nodes(state: GraphState) -> GraphState:
+    """Merge similar nodes based on title and content similarity."""
+    print("\nMerging similar nodes...")
+    llm = ChatOpenAI(temperature=0, model="gpt-4")
+    
+    # Update existing titles to remove 'biology' suffix
+    for node_id, node in state.nodes.items():
+        if "의 biology" in node.title:
+            node.title = node.title.replace("의 biology", "")
+    
+    # Group nodes by their base title
+    title_groups = {}
+    for node_id, node in state.nodes.items():
+        base_title = node.title.strip()
+        if base_title not in title_groups:
+            title_groups[base_title] = []
+        title_groups[base_title].append((node_id, node))
+    
+    # Merge nodes with same base title
+    for base_title, nodes in title_groups.items():
+        if len(nodes) > 1:
+            print(f"\nFound multiple nodes for '{base_title}'")
+            
+            # Find the existing node ID (from Supabase) to use as primary
+            primary_id = None
+            primary_node = None
+            for node_id, node in nodes:
+                # Check if this is an existing node from Supabase (has empty content)
+                if not node.content:
+                    primary_id = node_id
+                    primary_node = node
+                    break
+            
+            # If no existing node found, use the first node
+            if not primary_id:
+                primary_id, primary_node = nodes[0]
+            
+            # Merge other nodes into primary
+            for other_id, other_node in nodes:
+                if other_id != primary_id:
+                    print(f"Merging node {other_id} into {primary_id}")
+                    # Merge content only if it's not empty
+                    if other_node.content:
+                        primary_node.merge_content(other_node.content, llm)
+                    
+                    # Merge relationships
+                    for rel_type, rel_list in other_node.relationships.items():
+                        if rel_type not in primary_node.relationships:
+                            primary_node.relationships[rel_type] = []
+                        for rel in rel_list:
+                            if rel not in primary_node.relationships[rel_type]:
+                                primary_node.relationships[rel_type].append(rel)
+                                
+                    # Update references to the merged node
+                    for _, node in state.nodes.items():
+                        for rel_type, rel_list in node.relationships.items():
+                            for rel in rel_list:
+                                if isinstance(rel, dict) and rel.get("node_id") == other_id:
+                                    rel["node_id"] = primary_id
+                                elif isinstance(rel, str) and rel == other_id:
+                                    rel_list[rel_list.index(rel)] = primary_id
+                    
+                    # Remove merged node
+                    del state.nodes[other_id]
+    
+    return state
 
 if __name__ == "__main__":
     # Create the processor
     processor = create_legal_doc_processor()
     
     # Initialize state with example nodes
-    initial_state = GraphState()
-    initial_state.nodes["node_1"] = Node(
-        content="Corporate tax deductions are allowable for ordinary and necessary business expenses incurred during the taxable year.",
-        node_type="tax_regulation"
+    initial_state = GraphState(
+        nodes={
+            "node_1": Node(
+                content="Corporate tax deductions are allowable for ordinary and necessary business expenses incurred during the taxable year.",
+                node_type="tax_regulation"
+            )
+        }
     )
     
     # Example chunk to process
@@ -732,11 +769,11 @@ if __name__ == "__main__":
     """
     
     # Process the chunk
-    process_document_chunk(example_chunk, initial_state)
+    result_state = process_document_chunk(processor, initial_state, example_chunk)
     
     # Print results
     print("\nProcessed Knowledge Graph:")
-    for node_id, node in initial_state.nodes.items():
+    for node_id, node in result_state.nodes.items():
         print(f"\nNode {node_id} ({node.node_type}):")
         print(f"Content: {node.content}")
         print("Relationships:", node.relationships) 
